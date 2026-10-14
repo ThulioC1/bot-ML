@@ -1,0 +1,61 @@
+# ==========================================================================
+#  SEGREDOS — nunca versionar
+# ==========================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# ==========================================================================
+#  SESSAO TELEGRAM (Telethon) — autenticacao da sua conta
+# ==========================================================================
+*.session
+*.session-journal
+*.session.sqlite*
+
+# ==========================================================================
+#  BACKUPS E BYTECODE
+# ==========================================================================
+*.backup
+*.backup2
+*.bak
+*.old
+*.orig
+*.pyc-backup
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================================================================
+#  ESTADO DE EXECUCAO — recriado sozinho pelo bot, e os links
+#  ja embutem suas tags de afiliado (nao deixe isso publico)
+# ==========================================================================
+seen.json
+vitrine.json
+ig_queue.json
+ig_seen.json
+telegram_offset.json
+
+# ==========================================================================
+#  ARQUIVOS GERADOS EM RUNTIME
+# ==========================================================================
+arte_*.jpg
+arte_produto_temp.jpg
+*.log
+nohup.out
+
+# ==========================================================================
+#  SISTEMA / EDITOR / SO
+# ==========================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

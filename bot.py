@@ -1,0 +1,1555 @@
+# -*- coding: utf-8 -*-
+"""
+Bot de ofertas - Vagante Promoções
+
+Fontes : Google Sheets (principal) | Mercado Livre | Shopee | Amazon | Canais Telegram | Chat privado
+Saídas : Telegram (canal + chat privado) | Instagram (com arte personalizada e preço)
+
+Execução:  python bot.py
+"""
+
+import csv
+import hashlib
+import io
+import json
+import os
+import random
+import re
+import sys
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+# Impersonação de TLS: alguns marketplaces bloqueiam requests comuns.
+try:
+    from curl_cffi import requests as cureq
+    HAVE_CURL_CFFI = True
+except Exception:
+    cureq = requests
+    HAVE_CURL_CFFI = False
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _setup_stdout():
+    """O console do Windows usa cp1252 e estoura ao imprimir emoji."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_setup_stdout()
+
+
+def log(msg):
+    print(f"[{time.strftime('%d/%m %H:%M:%S')}] {msg}", flush=True)
+
+
+# --------------------------------------------------------------------------
+# Configuração
+# --------------------------------------------------------------------------
+
+def env(name, default=""):
+    return (os.getenv(name, default) or "").strip().strip('"').strip("'").replace("\n", "").replace("\r", "")
+
+
+TELEGRAM_TOKEN = env("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID") or env("TARGET_CHAT_ID")
+IG_ACCESS_TOKEN = env("IG_ACCESS_TOKEN")
+IG_USER_ID = env("IG_USER_ID")
+BLOB_TOKEN = env("BLOB_READ_WRITE_TOKEN")
+
+ML_MATT_WORD = env("ML_MATT_WORD") or env("ML_AFFILIATE_USERNAME")
+ML_MATT_TOOL = env("ML_MATT_TOOL") or env("ML_AFFILIATE_TOOL_ID")
+SHOPEE_TAG = env("SHOPEE_TAG") or env("SHOPEE_AFFILIATE_ID")
+AMAZON_TAG = env("AMAZON_TAG")
+
+FOOTER_TEXT = env("FOOTER", "🔗 Links afiliados. Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo")
+
+SHEET_CSV_URL = env(
+    "SHEET_CSV_URL",
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vRKHrxu8OFtNtgj6Hs6IlPIhg-mhQbHXrQxi6uiSnoTZI_I3RGk26SE5fMoUz2nMU3X95w0_OmLxfOa/pub?output=csv",
+)
+
+SOURCE_CHANNELS = [c.strip() for c in env("SOURCE_CHANNELS").split(",") if c.strip()]
+SEARCH_TERMS = [t.strip() for t in env("SEARCH_TERMS").split(",") if t.strip()]
+
+# Mercado Livre e Shopee bloqueiam por IP (PolicyAgent / 403). Sem trocar o IP de
+# saida, a raspagem direta nao funciona. Defina um proxy estavel aqui.
+# Formatos aceitos:  http://usuario:senha@host:porta   |   http://host:porta
+PROXY_URL = env("PROXY") or env("HTTPS_PROXY")
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+PROBE_AT = 0
+PROBE_STATE = {"ok": None, "msg": ""}
+
+INTERVAL_TELEGRAM = int(env("INTERVAL_TELEGRAM", "3600") or 3600)
+INTERVAL_INSTAGRAM = int(env("INTERVAL_INSTAGRAM", "10800") or 10800)
+POSTS_PER_CYCLE = int(env("POSTS_PER_CYCLE", "2") or 2)
+
+SEEN_FILE = BASE_DIR / "seen.json"
+IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
+VITRINE_FILE = BASE_DIR / "vitrine.json"
+OFFSET_FILE = BASE_DIR / "telegram_offset.json"
+TEMPLATE_FILE = BASE_DIR / "img" / "template.png"
+
+# Geometria do template, medida em img/template.png (1024x217).
+# O quadro de vidro a direita e onde o preco deve ficar.
+TEMPLATE_W, TEMPLATE_H = 1024, 217
+TEMPLATE_BOX = (576, 28, 951, 183)   # borda externa do quadro
+TEMPLATE_BOX_PAD = 10                # margem de seguranca dentro do quadro
+# Card final: produto em cima, banner com o preco embaixo (opcao C).
+ART_W, ART_H = 1080, 1350
+# Fator entre as medidas do template (1024 de largura) e o card final (1080).
+_TPL_SCALE = ART_W / TEMPLATE_W
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.mercadolivre.com.br/",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+BLOCKED_SOURCES = set()
+
+
+# --------------------------------------------------------------------------
+# Utilidades
+# --------------------------------------------------------------------------
+
+def proxy_health():
+    """Testa o proxy uma vez por ciclo. Morto = fallback para conexao direta.
+
+    Sem proxy o ML ainda funciona no IP residencial do celular. Com proxy
+    quebrado TODAS as requisicoes falhavam, ate a leitura da planilha do
+    Google Sheets -- que nem precisa de proxy. Por isso, proxy morto e
+    desligado em vez de só avisado.
+    """
+    global PROBE_AT, PROXIES
+    if not PROXIES:
+        return False
+    if time.time() - PROBE_AT < 600:
+        return PROBE_STATE["ok"]
+    PROBE_AT = time.time()
+    try:
+        resp = requests.get("https://api.ipify.org?format=json", proxies=PROXIES, timeout=15)
+        ip = resp.json().get("ip") if resp.status_code == 200 else None
+        if ip:
+            PROBE_STATE["ok"] = True
+            PROBE_STATE["msg"] = f"proxy ativo, IP de saida {ip}"
+            log(f"🌐 {PROBE_STATE['msg']}")
+        else:
+            PROBE_STATE["ok"] = False
+            PROBE_STATE["msg"] = f"proxy respondeu HTTP {resp.status_code}"
+    except Exception as exc:
+        PROBE_STATE["ok"] = False
+        PROBE_STATE["msg"] = f"proxy indisponivel ({type(exc).__name__})"
+    if not PROBE_STATE["ok"]:
+        log(f"⚠️ {PROBE_STATE['msg']} — PROXY desligado. Seguindo com a conexão direta: "
+            f"Mercado Livre continua funcionando, Shopee pode bloquear.")
+        PROXIES = None
+    return PROBE_STATE["ok"]
+
+
+def http_get(url, headers=None, timeout=20, referer=None):
+    """GET com impersonação de navegador e proxy opcional (necessário no ML/Shopee)."""
+    hdrs = dict(HEADERS)
+    if headers:
+        hdrs.update(headers)
+    if referer:
+        hdrs["Referer"] = referer
+    try:
+        if HAVE_CURL_CFFI:
+            resp = cureq.get(url, headers=hdrs, impersonate="chrome131", timeout=timeout,
+                             proxies=PROXIES)
+        else:
+            resp = requests.get(url, headers=hdrs, timeout=timeout, proxies=PROXIES)
+        blocked = ("account-verification" in resp.text[:2000]
+                   or "suspicious-traffic" in resp.text[:2000])
+        if blocked or resp.status_code in (403, 429, 520):
+            host = urllib.parse.urlparse(url).netloc
+            if host not in BLOCKED_SOURCES:
+                BLOCKED_SOURCES.add(host)
+                log(f"🚫 {host} bloqueou o acesso (HTTP {resp.status_code}"
+                    f"{', pagina de verificacao' if blocked else ''}).")
+        return resp
+    except Exception as exc:
+        if PROXIES:
+            PROBE_STATE["ok"] = False
+            PROBE_STATE["msg"] = f"proxy falhou: {type(exc).__name__}"
+        log(f"⚠️  Falha de rede em {url[:60]}: {type(exc).__name__}")
+        return None
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        if Path(path).exists():
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, type(default)):
+                    return data
+    except Exception:
+        pass
+    return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log(f"⚠️ Não foi possível salvar {Path(path).name}: {exc}")
+
+
+def parse_money(text):
+    """Converte '1.234,56' / '1234.56' / 'R$ 89,90' em float."""
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return float(text)
+    raw = str(text).strip()
+    if not raw:
+        return None
+    raw = re.sub(r"[^\d.,]", "", raw.replace("\u00a0", " ").replace(" ", ""))
+    if not raw:
+        return None
+    if "," in raw and "." in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    elif "," in raw:
+        raw = raw.replace(",", ".")
+    else:
+        parts = raw.split(".")
+        if len(parts) > 2:
+            raw = "".join(parts)
+        elif len(parts) == 2 and len(parts[1]) == 3:
+            raw = raw.replace(".", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def brl(value):
+    """Formata float no padrão brasileiro (1.234,56)."""
+    if value is None:
+        return ""
+    formatted = f"{float(value):,.2f}"
+    return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def expand_url(url):
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=8,
+                             headers={"User-Agent": BROWSER_UA}, proxies=PROXIES)
+        return resp.url or url
+    except Exception:
+        try:
+            resp = requests.get(url, allow_redirects=True, timeout=8, stream=True,
+                                headers={"User-Agent": BROWSER_UA}, proxies=PROXIES)
+            return resp.url or url
+        except Exception:
+            return url
+
+
+# --------------------------------------------------------------------------
+# Links de afiliado
+# --------------------------------------------------------------------------
+
+def clean_params(url, drop_keys):
+    """Remove as chaves de afiliado existentes e devolve apenas os params de tracking."""
+    parsed = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    for key in drop_keys:
+        params.pop(key, None)
+    return parsed, params
+
+
+def append_query(url, tracking):
+    """Acrescenta params de afiliado preservando os que já existiam na URL."""
+    parsed, params = clean_params(url, list(tracking.keys()))
+    for key, value in tracking.items():
+        params[key] = [value]
+    query = urllib.parse.urlencode(params, doseq=True)
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment)
+    )
+
+
+MARKETPLACES = ("mercadolivre", "mercadolibre", "meli.la", "shopee", "shope.ee",
+                "amazon", "amzn.to", "a.co", "magazineluiza", "buscape", "submarino")
+
+
+def is_product_url(url):
+    """True se o link for de um marketplace (ignora t.me, instagram, etc.)."""
+    return any(domain in url.lower() for domain in MARKETPLACES)
+
+
+def affiliate_link(url):
+    """Aplica o identificador de afiliado conforme o marketplace."""
+    if not url:
+        return url
+    url = url.rstrip(".,)")
+    low = url.lower()
+
+    # meli.la e link encurtado do ML. Se conseguir expandir, aplica no link final;
+    # se nao conseguir (ML bloqueando este IP), aplica direto no meli.la, que
+    # tambem aceita os parametros de afiliado.
+    if "meli.la" in low:
+        tracking = {"matt_word": ML_MATT_WORD, "matt_tool": ML_MATT_TOOL} if (ML_MATT_WORD and ML_MATT_TOOL) else {}
+        expanded = expand_url(url)
+        if expanded and "mercadolivre" in expanded.lower():
+            return append_query(expanded, tracking) if tracking else expanded
+        return append_query(url, tracking) if tracking else url
+
+    if "mercadolivre" in low or "mercadolibre" in low:
+        if not (ML_MATT_WORD and ML_MATT_TOOL):
+            return url
+        return append_query(url, {"matt_word": ML_MATT_WORD, "matt_tool": ML_MATT_TOOL})
+
+    if "shopee" in low or "shope.ee" in low:
+        if "s.shopee.com" in low or "shope.ee" in low:
+            expanded = expand_url(url)
+            if expanded and "shopee" in expanded.lower():
+                url = expanded
+                low = url.lower()
+        if not SHOPEE_TAG:
+            return url
+        return append_query(url, {"smtt": SHOPEE_TAG})
+
+    if "amazon" in low or "amzn.to" in low or "a.co" in low:
+        if "amzn.to" in low or "a.co" in low:
+            expanded = expand_url(url)
+            if expanded and "amazon" in expanded.lower():
+                url = expanded
+        if not AMAZON_TAG:
+            return url
+        return append_query(url, {"tag": AMAZON_TAG})
+
+    return url
+
+
+# --------------------------------------------------------------------------
+# Vercel Blob
+# --------------------------------------------------------------------------
+
+def upload_to_blob(file_path, remote_name):
+    if not BLOB_TOKEN or not Path(file_path).exists():
+        return None
+    try:
+        with open(file_path, "rb") as fh:
+            payload = fh.read()
+        resp = requests.put(
+            f"https://blob.vercel-storage.com/{remote_name}",
+            data=payload,
+            headers={"Authorization": f"Bearer {BLOB_TOKEN}"},
+            timeout=45,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("url")
+        log(f"⚠️ Blob: status {resp.status_code} ao enviar {remote_name}")
+    except Exception as exc:
+        log(f"⚠️ Blob: {exc}")
+    return None
+
+
+# --------------------------------------------------------------------------
+# Telegram
+# --------------------------------------------------------------------------
+
+def tg_api(method, payload=None, files=None, timeout=60):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    try:
+        if files:
+            resp = requests.post(url, data=payload, files=files, timeout=timeout)
+        else:
+            resp = requests.post(url, json=payload, timeout=timeout)
+        if resp.status_code != 200:
+            log(f"⚠️ Telegram {method}: {resp.status_code} {resp.text[:180]}")
+            return None
+        return resp.json().get("result")
+    except Exception as exc:
+        log(f"⚠️ Telegram {method}: {exc}")
+        return None
+
+
+def download_image(url, timeout=25):
+    """Baixa a imagem localmente. O Telegram recusa CDNs que ele não consegue ler."""
+    if not url or not str(url).lower().startswith(("http://", "https://")):
+        return None
+    try:
+        resp = http_get(url, headers={"Accept": "image/*,*/*"}, timeout=timeout)
+        if resp is None or resp.status_code != 200:
+            return None
+        data = resp.content
+        if len(data) < 2000:
+            return None
+        content = (resp.headers.get("Content-Type") or "image/jpeg").lower()
+        ext = ".png" if "png" in content else (".webp" if "webp" in content else ".jpg")
+        path = BASE_DIR / f"img_{int(time.time()*1000)}{random.randint(100,999)}{ext}"
+        path.write_bytes(data)
+        return path
+    except Exception:
+        return None
+
+
+def send_message(text, chat_id=None, photo_url=None, reply_to=None):
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id:
+        log("⚠️ Token ou Chat ID do Telegram ausentes.")
+        return False
+
+    if photo_url:
+        payload = {"chat_id": chat_id, "caption": text[:1024]}
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+
+        local = download_image(photo_url)
+        if local:
+            try:
+                with open(local, "rb") as fh:
+                    result = tg_api("sendPhoto", payload,
+                                    files={"photo": (local.name, fh)}, timeout=90)
+            finally:
+                Path(local).unlink(missing_ok=True)
+            if result:
+                return True
+        else:
+            result = tg_api("sendPhoto", dict(payload, photo=photo_url), timeout=90)
+            if result:
+                return True
+        log("⚠️ Telegram recusou a foto; enviando apenas texto.")
+
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    return bool(tg_api("sendMessage", payload))
+
+
+def get_chat_name(chat_id):
+    result = tg_api("getChat", {"chat_id": chat_id}, timeout=15)
+    return result.get("title") or result.get("username") or str(chat_id) if result else str(chat_id)
+
+
+def check_credentials():
+    if not TELEGRAM_TOKEN:
+        log("❌ TELEGRAM_TOKEN ausente no .env — o bot não pode funcionar.")
+        return False
+    me = tg_api("getMe", timeout=20)
+    if not me:
+        log("❌ Token do Telegram recusado pela API.")
+        return False
+    log(f"✅ Telegram conectado como @{me.get('username')}")
+
+    if TELEGRAM_CHAT_ID:
+        log(f"✅ Canal de destino: {get_chat_name(TELEGRAM_CHAT_ID)}")
+    if SOURCE_CHANNELS:
+        log(f"👂 Canais monitorados: {', '.join(SOURCE_CHANNELS)}")
+    return True
+
+
+# --------------------------------------------------------------------------
+# Instagram
+# --------------------------------------------------------------------------
+
+def resolve_ig_user_id():
+    """Corrige automaticamente o IG_USER_ID quando o .env está com o valor errado."""
+    global IG_USER_ID
+    if not IG_ACCESS_TOKEN:
+        log("⚠️ IG_ACCESS_TOKEN ausente — Instagram desativado.")
+        return False
+    try:
+        resp = requests.get(
+            f"https://graph.instagram.com/v18.0/me",
+            params={"fields": "id,username", "access_token": IG_ACCESS_TOKEN},
+            timeout=25,
+        )
+        data = resp.json()
+    except Exception as exc:
+        log(f"⚠️ Instagram: {exc}")
+        return False
+
+    if "id" not in data:
+        log(f"❌ Token do Instagram inválido: {str(data)[:180]}")
+        return False
+
+    real_id = data["id"]
+    log(f"✅ Instagram conectado como @{data.get('username')} (id {real_id})")
+    if not IG_USER_ID or str(IG_USER_ID) != str(real_id):
+        if IG_USER_ID:
+            log(f"⚠️ IG_USER_ID do .env ({IG_USER_ID}) está incorreto. Usando o id real {real_id}.")
+        else:
+            log(f"⚠️ IG_USER_ID ausente no .env. Adicione: IG_USER_ID={real_id}")
+        IG_USER_ID = real_id
+    return True
+
+
+def post_to_instagram(image_url, caption):
+    if not IG_ACCESS_TOKEN or not IG_USER_ID or not image_url:
+        log("⏭️ Instagram ignorado: sem token, id ou imagem pública.")
+        return False
+    try:
+        container = requests.post(
+            f"https://graph.instagram.com/v18.0/{IG_USER_ID}/media",
+            data={"image_url": image_url, "caption": caption, "access_token": IG_ACCESS_TOKEN},
+            timeout=60,
+        ).json()
+        if "id" not in container:
+            log(f"❌ Instagram container: {str(container)[:220]}")
+            return False
+
+        time.sleep(6)
+        published = requests.post(
+            f"https://graph.instagram.com/v18.0/{IG_USER_ID}/media_publish",
+            data={"creation_id": container["id"], "access_token": IG_ACCESS_TOKEN},
+            timeout=60,
+        ).json()
+        if "id" in published:
+            log(f"✅ Instagram publicado: {published['id']}")
+            return True
+        log(f"❌ Instagram publish: {str(published)[:220]}")
+    except Exception as exc:
+        log(f"⚠️ Instagram: {exc}")
+    return False
+
+
+# --------------------------------------------------------------------------
+# Arte personalizada
+# --------------------------------------------------------------------------
+
+FONT_BOLD = [
+    r"C:\Windows\Fonts\ariblk.ttf", r"C:\Windows\Fonts\arialbd.ttf",
+    r"C:\Windows\Fonts\segoeuib.ttf", r"C:\Windows\Fonts\calibrib.ttf",
+    r"C:\Windows\Fonts\DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+FONT_REGULAR = [
+    r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\calibri.ttf", r"C:\Windows\Fonts\DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+
+
+def load_font(size, bold=True):
+    for path in (FONT_BOLD if bold else FONT_REGULAR):
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def gradient(size, top=(18, 28, 58), bottom=(94, 32, 120)):
+    width, height = size
+    ramp = Image.new("RGBA", (1, height))
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
+        ramp.putpixel((0, y), tuple(int(top[i] + (bottom[i] - top[i]) * ratio) for i in range(3)) + (255,))
+    return ramp.resize(size, Image.Resampling.BILINEAR)
+
+
+def text_block(draw, xy, text, font, fill, anchor_center_x=None, stroke=0, stroke_fill=(0, 0, 0, 255)):
+    if anchor_center_x is not None:
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+        xy = (anchor_center_x - (bbox[2] - bbox[0]) / 2 - bbox[0], xy[1])
+    draw.text(xy, text, font=font, fill=fill, stroke_width=stroke, stroke_fill=stroke_fill)
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    return bbox[3] - bbox[1]
+
+
+def _fit_font(draw, text, max_w, max_h, start, bold=True, minimum=16):
+    """Maior tamanho de fonte em que `text` cabe dentro de max_w x max_h."""
+    size = start
+    while size > minimum:
+        font = load_font(size, bold=bold)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if (bbox[2] - bbox[0]) <= max_w and (bbox[3] - bbox[1]) <= max_h:
+            return font, bbox
+        size -= 2
+    font = load_font(minimum, bold=bold)
+    return font, draw.textbbox((0, 0), text, font=font)
+
+
+def _draw_price_in_box(draw, box, preco, preco_original):
+    """Escreve o preco DENTRO do quadro de vidro. box = (x1, y1, x2, y2)."""
+    bx1, by1, bx2, by2 = box
+    inner_w = (bx2 - bx1) - 2 * TEMPLATE_BOX_PAD * _TPL_SCALE
+    inner_h = (by2 - by1) - 2 * TEMPLATE_BOX_PAD * _TPL_SCALE
+    cx = (bx1 + bx2) / 2
+
+    tem_de = bool(preco_original and preco and preco_original > preco)
+    if tem_de:
+        de_text = f"DE R$ {brl(preco_original)}"
+        por_text = f"POR R$ {brl(preco)}"
+    elif preco:
+        de_text, por_text = None, f"R$ {brl(preco)}"
+    else:
+        de_text, por_text = None, "Confira na bio"
+
+    if de_text:
+        de_font, de_bbox = _fit_font(draw, de_text, inner_w, inner_h * 0.34, 46, bold=False)
+        por_font, por_bbox = _fit_font(draw, por_text, inner_w, inner_h * 0.60, 62)
+        gap = 10 * _TPL_SCALE
+        h_de = de_bbox[3] - de_bbox[1]
+        h_por = por_bbox[3] - por_bbox[1]
+        top = (by1 + by2) / 2 - (h_de + gap + h_por) / 2
+        draw.text((cx, top), de_text, font=de_font, fill=(226, 240, 252), anchor="ma",
+                  stroke_width=2, stroke_fill=(18, 52, 92, 200))
+        draw.text((cx, top + h_de + gap), por_text, font=por_font, fill=(255, 255, 255),
+                  anchor="ma", stroke_width=3, stroke_fill=(16, 48, 88, 255))
+    else:
+        por_font, por_bbox = _fit_font(draw, por_text, inner_w, inner_h, 62)
+        h_por = por_bbox[3] - por_bbox[1]
+        top = (by1 + by2) / 2 - h_por / 2
+        draw.text((cx, top), por_text, font=por_font, fill=(255, 255, 255), anchor="ma",
+                  stroke_width=3, stroke_fill=(16, 48, 88, 255))
+
+
+def _draw_discount_badge(draw, box, desconto_pct):
+    """Selo -N% no gelo vazio a esquerda do quadro (fora do quadro do preco)."""
+    badge = f"-{int(desconto_pct)}%"
+    font = load_font(46, bold=True)
+    bbox = draw.textbbox((0, 0), badge, font=font)
+    bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad_x, pad_y = 26, 14
+    right = box[0] - 24 * _TPL_SCALE
+    left = right - bw - 2 * pad_x
+    top = (box[1] + box[3]) / 2 - bh / 2
+    draw.rounded_rectangle((left, top - pad_y, right, top + bh + pad_y),
+                           radius=16, fill=(34, 197, 94, 255))
+    draw.text((left + pad_x, top), badge, font=font, fill=(255, 255, 255), anchor="la")
+
+
+def gerar_arte(image_url, preco, preco_original=None, titulo="", desconto_pct=None, usar_template=True):
+    """Card 1080x1350: foto do produto em cima, banner img/template.png embaixo
+    com o preco dentro do quadro de vidro. O titulo NAO vai na arte (fica na
+    descricao do post)."""
+    output = BASE_DIR / f"arte_{int(time.time())}_{random.randint(1000, 9999)}.jpg"
+    try:
+        has_template = bool(usar_template and TEMPLATE_FILE.exists())
+        canvas = gradient((ART_W, ART_H))
+
+        product = None
+        if image_url:
+            try:
+                resp = http_get(image_url, headers={"Referer": "https://www.mercadolivre.com.br/"}, timeout=20)
+                if resp is not None and resp.status_code == 200 and len(resp.content) > 1500:
+                    product = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+            except Exception:
+                product = None
+
+        # --- Faixa do banner (opção C: banner na parte de baixo) ---
+        banner_h = round(ART_W * TEMPLATE_H / TEMPLATE_W) if has_template else 0
+        banner_top = ART_H - banner_h
+        if has_template:
+            banner = Image.open(TEMPLATE_FILE).convert("RGBA")
+            if banner.size != (ART_W, banner_h):
+                banner = banner.resize((ART_W, banner_h), Image.Resampling.LANCZOS)
+            canvas.alpha_composite(banner, (0, banner_top))
+
+        # --- Foto do produto, na area de cima ---
+        box = (90, 70, ART_W - 90, banner_top - 70 if has_template else ART_H - 150)
+        draw = ImageDraw.Draw(canvas)
+        if product is not None:
+            product.thumbnail((box[2] - box[0], box[3] - box[1]), Image.Resampling.LANCZOS)
+            shadow = Image.new("RGBA", product.size, (0, 0, 0, 0))
+            shadow.paste((0, 0, 0, 130), (0, 0), product)
+            shadow = shadow.filter(ImageFilter.GaussianBlur(22))
+            px = box[0] + (box[2] - box[0] - product.width) // 2
+            py = box[1] + (box[3] - box[1] - product.height) // 2
+            canvas.alpha_composite(shadow, (px + 8, py + 16))
+            canvas.paste(product, (px, py), product)
+        else:
+            # ImageDraw sobrescreve o pixel (nao faz alpha-blend): o retangulo
+            # translucido precisa ir num overlay separado.
+            overlay = Image.new("RGBA", (ART_W, ART_H), (0, 0, 0, 0))
+            odraw = ImageDraw.Draw(overlay)
+            odraw.rounded_rectangle(box, radius=32, fill=(255, 255, 255, 26),
+                                    outline=(255, 255, 255, 70), width=3)
+            odraw.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2 - 30),
+                       "sem imagem", font=load_font(46, bold=False),
+                       fill=(255, 255, 255, 150), anchor="mm")
+            canvas = Image.alpha_composite(canvas, overlay)
+            draw = ImageDraw.Draw(canvas)
+
+        # --- Preco dentro do quadro de vidro do banner ---
+        if has_template:
+            price_box = tuple(
+                v * _TPL_SCALE + (banner_top if i % 2 else 0)
+                for i, v in enumerate(TEMPLATE_BOX)
+            )
+            if desconto_pct and desconto_pct >= 5:
+                _draw_discount_badge(draw, price_box, desconto_pct)
+            _draw_price_in_box(draw, price_box, preco, preco_original)
+        else:
+            # Sem template: cartao escuro com o preco embaixo.
+            y = ART_H - banner_h - 210 if banner_h else ART_H - 200
+            if preco_original and preco and preco_original > preco:
+                draw.text((ART_W / 2, y), f"DE R$ {brl(preco_original)}",
+                          font=load_font(52), fill=(255, 255, 255, 180), anchor="mm")
+                price_text = f"POR R$ {brl(preco)}"
+            elif preco:
+                price_text = f"R$ {brl(preco)}"
+            else:
+                price_text = "Confira o preço na bio"
+            font_price, bbox = _fit_font(draw, price_text, ART_W - 200, 150, 104)
+            pw, ph = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            pad = 34
+            draw.rounded_rectangle((ART_W / 2 - pw / 2 - pad, y + 110 - pad / 2,
+                                    ART_W / 2 + pw / 2 + pad, y + 110 + ph + pad),
+                                   radius=30, fill=(255, 255, 255, 235))
+            draw.text((ART_W / 2, y + 110 + ph / 2 - 3), price_text, font=font_price,
+                      fill=(18, 28, 58, 255), anchor="mm")
+
+        canvas.convert("RGB").save(output, "JPEG", quality=94)
+        return output
+    except Exception as exc:
+        log(f"⚠️ Erro ao gerar a arte: {exc}")
+        return None
+
+
+def arte_para_publicar(image_url, preco, preco_original=None, desconto=None, titulo=""):
+    """Gera a arte e devolve a URL pública (upload no Vercel Blob)."""
+    path = gerar_arte(image_url, preco, preco_original, titulo=titulo, desconto_pct=desconto)
+    if not path:
+        return image_url
+    url = upload_to_blob(path, Path(path).name)
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+    return url or image_url
+
+
+# --------------------------------------------------------------------------
+# Formatação
+# --------------------------------------------------------------------------
+
+def price_block(preco, preco_original):
+    if preco_original and preco and preco_original > preco:
+        return f"📉 De R$ {brl(preco_original)}\n🔥 Por R$ {brl(preco)}"
+    if preco:
+        return f"💰 R$ {brl(preco)}"
+    return ""
+
+
+def discount_pct(preco, preco_original):
+    if preco and preco_original and preco_original > preco:
+        return (preco_original - preco) / preco_original * 100
+    return None
+
+
+# --------------------------------------------------------------------------
+# Fontes de produtos
+# --------------------------------------------------------------------------
+
+def fetch_sheet_products():
+    """Lê os produtos da planilha publicada do Google Sheets (fonte principal)."""
+    products = []
+    resp = http_get(SHEET_CSV_URL, headers={"Accept": "text/csv,*/*"}, timeout=20)
+    if resp is None or resp.status_code != 200:
+        log(f"⚠️ Planilha indisponível (HTTP {getattr(resp, 'status_code', 'erro')}).")
+        return products
+
+    try:
+        reader = csv.reader(io.StringIO(resp.text))
+        header = next(reader, None)
+        if not header:
+            return products
+        header = [c.strip().lower().lstrip("\ufeff") for c in header]
+        cols = {name: idx for idx, name in enumerate(header)}
+
+        def pick(*names):
+            for name in names:
+                if name in cols:
+                    return cols[name]
+            return None
+
+        c_link = pick("link", "url", "produto")
+        c_price = pick("preço", "preco", "price", "valor")
+        c_title = pick("titulo", "título", "title", "nome")
+        c_photo = pick("foto", "imagem", "image", "thumb")
+        c_old = pick("preço antigo", "preco antigo", "preço original", "de", "original")
+
+        if c_link is None:
+            c_link = 0
+
+        for row in reader:
+            if not row or len(row) <= c_link:
+                continue
+            raw_link = row[c_link].replace('"', "").strip()
+            title = row[c_title].strip().replace('"', "") if c_title is not None and len(row) > c_title else ""
+            photo = row[c_photo].strip().replace('"', "") if c_photo is not None and len(row) > c_photo else ""
+            if not raw_link.lower().startswith("http") or not title:
+                continue
+
+            price = parse_money(row[c_price]) if c_price is not None and len(row) > c_price else None
+            old = parse_money(row[c_old]) if c_old is not None and len(row) > c_old else None
+
+            products.append({
+                "id": "sheet_" + hashlib.md5(raw_link.encode()).hexdigest()[:12],
+                "title": title,
+                "price": price,
+                "original_price": old,
+                "permalink": raw_link,
+                "thumbnail": photo,
+                "source": "planilha",
+            })
+
+        log(f"📊 Planilha: {len(products)} produto(s) válido(s).")
+    except Exception as exc:
+        log(f"⚠️ Erro ao ler a planilha: {exc}")
+    return products
+
+
+def fetch_mercado_livre_products(search_query=None):
+    products = []
+    if search_query:
+        urls = [f"https://lista.mercadolivre.com.br/{urllib.parse.quote(search_query)}"]
+    else:
+        page = random.randint(1, 20)
+        urls = [f"https://www.mercadolivre.com.br/ofertas?page={page}"]
+
+    for url in urls:
+        resp = http_get(url, timeout=25)
+        if resp is None or resp.status_code != 200:
+            continue
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for item in soup.select("li.ui-search-layout__item, div.poly-card, .andes-card, .promotion-item, .ui-search-result"):
+            try:
+                title_el = item.select_one(".poly-component__title, .ui-search-item__title, h2, a[title]")
+                if not title_el:
+                    continue
+                title = (title_el.get("title") or title_el.get_text(strip=True)).strip()
+                link_el = item.select_one("a[href]")
+                permalink = (link_el.get("href") if link_el else "").split("#")[0]
+                if not title or not permalink.startswith("http"):
+                    continue
+
+                current = item.select_one(".andes-money-amount:not(.andes-money-amount--previous), .price-tag")
+                price = None
+                if current:
+                    frac = current.select_one(".andes-money-amount__fraction, .price-tag-fraction")
+                    cents = current.select_one(".andes-money-amount__cents, .price-tag-cents")
+                    if frac:
+                        price = parse_money(f"{frac.get_text(strip=True).replace('.', '')}.{cents.get_text(strip=True) if cents else '00'}")
+                    else:
+                        price = parse_money(current.get_text())
+
+                old_el = item.select_one(".andes-money-amount--previous, .price-tag-old, .poly-price__old")
+                old = parse_money(old_el.get_text()) if old_el else None
+
+                img = item.select_one("img")
+                thumb = (img.get("data-src") or img.get("src") or "") if img else ""
+
+                if price:
+                    products.append({
+                        "id": "ml_" + hashlib.md5(permalink.encode()).hexdigest()[:12],
+                        "title": title, "price": price, "original_price": old,
+                        "permalink": permalink, "thumbnail": thumb, "source": "raspagem",
+                    })
+            except Exception:
+                continue
+
+    if not products:
+        log("⚠️ Mercado Livre: 0 produtos (provável bloqueio anti-bot). A planilha é a fonte confiável.")
+    else:
+        random.shuffle(products)
+        log(f"✅ Mercado Livre: {len(products)} produto(s).")
+    return products
+
+
+def fetch_shopee_products(search_query=None):
+    products = []
+    keyword = search_query or "ofertas"
+    url = (f"https://shopee.com.br/api/v4/search/search_items?by=relevancy"
+           f"&keyword={urllib.parse.quote(keyword)}&limit=30&newest=0")
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://shopee.com.br/",
+        "x-api-source": "pc",
+        "x-shopee-language": "pt",
+        "x-requested-with": "XMLHttpRequest",
+    }
+    resp = http_get(url, headers=headers, timeout=20, referer="https://shopee.com.br/")
+    if resp is not None and resp.status_code == 200:
+        try:
+            data = resp.json()
+            for entry in data.get("items", []) or (data.get("data", {}) or {}).get("items", []):
+                basic = entry.get("item_basic") or entry
+                item_id, shop_id = basic.get("itemid"), basic.get("shopid")
+                title, raw = basic.get("name"), basic.get("price", 0)
+                if not (item_id and shop_id and title and raw):
+                    continue
+                price = float(raw) / 100000.0
+                old_raw = basic.get("price_before_discount", 0)
+                old = float(old_raw) / 100000.0 if old_raw and old_raw > raw else None
+                thumb = f"https://down-br.img.susercontent.com/file/{basic.get('image')}" if basic.get("image") else ""
+                products.append({
+                    "id": f"shopee_{shop_id}_{item_id}", "title": title, "price": price,
+                    "original_price": old, "permalink": f"https://shopee.com.br/product-i.{shop_id}.{item_id}",
+                    "thumbnail": thumb, "source": "raspagem",
+                })
+        except Exception as exc:
+            log(f"⚠️ Shopee: {exc}")
+    else:
+        status = getattr(resp, "status_code", "erro")
+        log(f"⚠️ Shopee bloqueada (HTTP {status}). A planilha é a fonte confiável.")
+
+    if products:
+        random.shuffle(products)
+        log(f"✅ Shopee: {len(products)} produto(s).")
+    return products
+
+
+def fetch_amazon_products(search_query=None):
+    products = []
+    keyword = search_query or "eletronicos ofertas"
+    url = f"https://www.amazon.com.br/s?k={urllib.parse.quote(keyword)}"
+    resp = http_get(url, timeout=25, referer="https://www.amazon.com.br/")
+    if resp is None or resp.status_code != 200:
+        log("⚠️ Amazon: página de busca indisponível (bloqueio anti-bot).")
+        return products
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for card in soup.select("div[data-component-type='s-search-result']"):
+        try:
+            asin = card.get("data-asin")
+            link = card.select_one("h2 a, a.a-link-normal")
+            title_el = card.select_one("h2 span, h2")
+            if not asin or not title_el:
+                continue
+            price_el = card.select_one(".a-price .a-offscreen")
+            old_el = card.select_one(".a-text-price .a-offscreen")
+            price = parse_money(price_el.get_text()) if price_el else None
+            if not price:
+                continue
+            href = (link.get("href") if link else f"/dp/{asin}") or ""
+            href = href.split("?")[0]
+            if href.startswith("/"):
+                href = "https://www.amazon.com.br" + href
+            img = card.select_one("img.s-image")
+            products.append({
+                "id": f"amz_{asin}", "title": title_el.get_text(strip=True), "price": price,
+                "original_price": parse_money(old_el.get_text()) if old_el else None,
+                "permalink": href,
+                "thumbnail": img.get("src") if img else "", "source": "raspagem",
+            })
+        except Exception:
+            continue
+
+    if products:
+        random.shuffle(products)
+        log(f"✅ Amazon: {len(products)} produto(s).")
+    else:
+        log("⚠️ Amazon: 0 produtos (provável bloqueio anti-bot).")
+    return products
+
+
+def collect_products(include_scrape=True, search_query=None):
+    products = fetch_sheet_products()
+    if search_query:
+        products += fetch_mercado_livre_products(search_query) + fetch_shopee_products(search_query) + fetch_amazon_products(search_query)
+    elif include_scrape:
+        products += fetch_mercado_livre_products() + fetch_shopee_products()
+    random.shuffle(products)
+    return products
+
+
+# --------------------------------------------------------------------------
+# Extração de metadados (link solto no chat privado)
+# --------------------------------------------------------------------------
+
+def _json_ld_products(soup):
+    found = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or script.text or "{}")
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        for item in stack:
+            if not isinstance(item, dict):
+                continue
+            if item.get("@type") == "Product":
+                found.append(item)
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                found.extend(n for n in graph if isinstance(n, dict) and n.get("@type") == "Product")
+    return found
+
+
+def extract_from_html(html, url):
+    soup = BeautifulSoup(html, "html.parser")
+    title, price, old_price, image = "", None, None, ""
+
+    og_title = soup.find("meta", property="og:title")
+    if og_title:
+        title = og_title.get("content", "")
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+
+    og_img = soup.find("meta", property="og:image")
+    if og_img:
+        image = og_img.get("content", "")
+
+    for product in _json_ld_products(soup):
+        if not title and product.get("name"):
+            title = product["name"]
+        image = image or product.get("image") or ""
+        if isinstance(image, list):
+            image = image[0] if image else ""
+        if not image:
+            for prop in product.get("additionalProperty", []) or []:
+                if prop.get("name") in ("image", "thumbnailUrl"):
+                    image = prop.get("value") or ""
+                    break
+        offers = product.get("offers") or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        if isinstance(offers, dict):
+            price = price or parse_money(offers.get("price") or offers.get("lowPrice") or offers.get("highPrice"))
+            old_price = old_price or parse_money(offers.get("original_price") or offers.get("listPrice"))
+        break
+
+    if price is None:
+        for prop, setter in (("product:price:amount", "p"), ("og:price:amount", "p"), ("twitter:data1", "p")):
+            meta = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+            if meta and meta.get("content"):
+                price = parse_money(meta.get("content"))
+                if price:
+                    break
+
+    if price is None:
+        current = (soup.select_one(".andes-money-amount--current .andes-money-amount__fraction")
+                   or soup.select_one(".price-tag-fraction")
+                   or soup.select_one("#priceblock_ourprice")
+                   or soup.select_one("#corePrice_feature_div .a-offscreen")
+                   or soup.select_one(".a-price .a-offscreen"))
+        if current:
+            price = parse_money(current.get_text(strip=True))
+        else:
+            match = re.search(r"R\$\s?([\d\.]+,\d{2})", soup.get_text(" ", strip=True)[:20000])
+            if match:
+                price = parse_money(match.group(1))
+
+    if old_price is None:
+        old_el = (soup.select_one(".andes-money-amount--previous .andes-money-amount__fraction")
+                  or soup.select_one("s .price-tag-fraction")
+                  or soup.select_one(".a-text-price .a-offscreen"))
+        if old_el:
+            old_price = parse_money(old_el.get_text(strip=True))
+
+    title = re.split(r"\s*[|\-–]\s*", title)[0].strip() if title else ""
+    return title[:180], price, (old_price if old_price and price and old_price > price else None), image
+
+
+def extract_product(url):
+    """Extrai título, preço e imagem de um link de marketplace."""
+    url = expand_url(url)
+    resp = http_get(url, timeout=25)
+    if resp is None or resp.status_code != 200:
+        return {"title": "", "price": None, "original_price": None, "image": "", "link": url}
+
+    if "account-verification" in resp.text[:2000] or "suspicious-traffic" in resp.text[:2000]:
+        return {"title": "", "price": None, "original_price": None, "image": "", "link": url,
+                "blocked": True}
+
+    try:
+        title, price, old_price, image = extract_from_html(resp.text, url)
+    except Exception as exc:
+        log(f"⚠️ Extração falhou: {exc}")
+        title, price, old_price, image = "", None, None, ""
+
+    return {"title": title, "price": price, "original_price": old_price, "image": image, "link": url}
+
+
+# --------------------------------------------------------------------------
+# Vitrine
+# --------------------------------------------------------------------------
+
+def save_to_vitrine(item):
+    vitrine = load_json(VITRINE_FILE, [])
+    if any(v.get("link") == item.get("link") for v in vitrine[:20]):
+        return
+    vitrine.insert(0, {
+        "id": item["id"],
+        "title": item["title"],
+        "price": item.get("price"),
+        "original_price": item.get("original_price"),
+        "link": item["link"],
+        "image": item.get("image") or "",
+        "time": time.strftime("%d/%m/%Y %H:%M"),
+    })
+    save_json(VITRINE_FILE, vitrine[:40])
+    log(f"📦 Vitrine atualizada ({len(vitrine[:40])} itens).")
+
+
+# --------------------------------------------------------------------------
+# Publicação
+# --------------------------------------------------------------------------
+
+def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
+    price = product.get("price")
+    old = product.get("original_price")
+    link = affiliate_link(product["permalink"])
+    title = product.get("title") or "Oferta Especial"
+
+    lines = ["🔥 OFERTA EM DESTAQUE", "", f"📦 {title}", ""]
+    block = price_block(price, old)
+    if block:
+        lines += block.split("\n") + [""]
+    lines += [f"🛒 Link: {link}"]
+    if chat_id is None:
+        lines += ["", FOOTER_TEXT]
+
+    text = "\n".join(lines)
+    ok = send_message(text, chat_id=chat_id, photo_url=product.get("thumbnail") or None, reply_to=reply_to)
+
+    if ok:
+        seen = load_json(SEEN_FILE)
+        seen[product["id"]] = {"price": price, "at": time.strftime("%d/%m %H:%M")}
+        save_json(SEEN_FILE, seen)
+        save_to_vitrine({
+            "id": product["id"], "title": title, "price": price,
+            "original_price": old, "link": link, "image": product.get("thumbnail") or "",
+        })
+
+    if announce_instagram:
+        schedule_instagram(product, title, price, old)
+    return ok
+
+
+def schedule_instagram(product, title, price, old):
+    pct = discount_pct(price, old)
+    image = product.get("thumbnail")
+    if not image:
+        log("⏭️ Instagram: produto sem imagem.")
+        return
+    queue = load_json(BASE_DIR / "ig_queue.json", [])
+    queue.append({"title": title, "price": price, "old": old, "image": image, "pct": pct})
+    save_json(BASE_DIR / "ig_queue.json", queue[-10:])
+    log(f"🖼️ Arte do post '{title[:32]}' entrou na fila do Instagram.")
+
+
+# --------------------------------------------------------------------------
+# Chat privado
+# --------------------------------------------------------------------------
+
+HELP = (
+    "🤖 *Vagante Promoções*\n\n"
+    "Envie um link de produto (Mercado Livre, Shopee, Amazon) que eu extraio "
+    "o preço e monto o post.\n\n"
+    "Comandos:\n"
+    "/start — esta ajuda\n"
+    "/canal <link> — publica direto no canal\n"
+    "/canal — publica o último link que você enviou\n"
+    "/preco <valor> <link> — monta o post com preço manual\n"
+    "/buscar <termo> — busca ofertas do termo\n"
+    "/status — diagnóstico das fontes\n"
+    "/ajuda — esta ajuda"
+)
+
+# Ultimo produto tratado por chat, para permitir /canal sem link
+LAST_PRODUCT = {}
+
+
+def handle_private_message(message):
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id"))
+    text = (message.get("text") or message.get("caption") or "").strip()
+    if not text:
+        return
+    message_id = message.get("message_id")
+    log(f"💬 Privado: {text[:70]}")
+
+    if text.startswith("/start") or text.startswith("/ajuda"):
+        send_message(HELP, chat_id=chat_id, reply_to=message_id)
+        return
+
+    if text.startswith("/status"):
+        sheet_state = "OK" if fetch_sheet_products() else "sem itens"
+        lines = [
+            "📡 *Status das fontes*",
+            f"• Planilha (Sheets): {sheet_state}",
+            f"• Proxy: {PROBE_STATE['msg'] if PROXIES else 'não configurado (ML/Shopee ficam bloqueados)'}",
+            f"• Mercado Livre: {'BLOQUEADO' if 'www.mercadolivre.com.br' in BLOCKED_SOURCES else 'liberado'}",
+            f"• Shopee: {'BLOQUEADO' if 'shopee.com.br' in BLOCKED_SOURCES else 'liberado'}",
+            f"• Amazon: {'BLOQUEADO' if 'www.amazon.com.br' in BLOCKED_SOURCES else 'liberado'}",
+            f"• Instagram: {'OK' if IG_ACCESS_TOKEN else 'sem token'}",
+            f"• Canal: {get_chat_name(TELEGRAM_CHAT_ID)}",
+        ]
+        send_message("\n".join(lines), chat_id=chat_id, reply_to=message_id)
+        return
+
+    if text.startswith("/buscar"):
+        query = text.split(" ", 1)[1].strip() if " " in text else ""
+        if not query:
+            send_message("Uso: /buscar <termo>", chat_id=chat_id, reply_to=message_id)
+            return
+        send_message(f"🔎 Buscando '{query}'...", chat_id=chat_id, reply_to=message_id)
+        results = collect_products(include_scrape=True, search_query=query)[:5]
+        if not results:
+            send_message("❌ Nenhuma oferta encontrada. Os sites podem estar bloqueando o acesso "
+                         "automático — nesse caso use a planilha.", chat_id=chat_id, reply_to=message_id)
+            return
+        blocks = []
+        for p in results:
+            block = price_block(p.get("price"), p.get("original_price")) or "💰 ver preço no link"
+            blocks.append(f"📦 {p['title'][:80]}\n{block}\n🔗 {affiliate_link(p['permalink'])}")
+        send_message("\n\n".join(blocks), chat_id=chat_id, reply_to=message_id)
+        return
+
+    urls = re.findall(r"https?://[^\s]+", text)
+    url = urls[0].rstrip(".,)") if urls else None
+
+    forced_price = None
+    manual = re.match(r"^/preco\s+([\d\.,]+)\s+(https?://.+)$", text, re.S)
+    if manual:
+        forced_price = parse_money(manual.group(1))
+        url = manual.group(2).strip()
+
+    # /canal sem link republica o ultimo produto guardado na sessao
+    if url is None and text.startswith("/canal"):
+        last = LAST_PRODUCT.get(chat_id)
+        if not last:
+            send_message("❓ Envie primeiro um link de produto. Depois use `/canal` "
+                         "sozinho para publicar o ultimo.",
+                         chat_id=chat_id, reply_to=message_id)
+            return
+        publish({**last, "permalink": affiliate_link(last["permalink"])})
+        send_message(f"✅ Publicado no canal: {last['title'][:60]}",
+                     chat_id=chat_id, reply_to=message_id)
+        return
+
+    if url is None:
+        send_message("❓ Envie um link de produto ou use /ajuda.", chat_id=chat_id, reply_to=message_id)
+        return
+
+    if not is_product_url(url) and forced_price is None:
+        send_message("⚠️ Esse link não é de Mercado Livre, Shopee ou Amazon.\n"
+                     "Envie um link de produto ou use /buscar <termo>.",
+                     chat_id=chat_id, reply_to=message_id)
+        return
+
+    send_message("🔍 Extraindo preço...", chat_id=chat_id, reply_to=message_id)
+    data = extract_product(url)
+
+    price = forced_price if forced_price is not None else data.get("price")
+    old = None if forced_price is not None else data.get("original_price")
+    title = data.get("title") or "Oferta Especial"
+    image = data.get("image") or ""
+    final_link = affiliate_link(data.get("link") or url)
+
+    if price is None:
+        send_message(
+            f"⚠️ Não consegli ler o preço de *{title}* automaticamente.\n\n"
+            "O marketplace está bloqueando acesso automatizado (anti-bot). "
+            "Verifique o proxy no /status.\n\n"
+            "Use o comando manual:\n"
+            f"`/preco 89,90 {final_link}`",
+            chat_id=chat_id, reply_to=message_id,
+        )
+        return
+
+    lines = [f"📦 *{title}*", ""]
+    block = price_block(price, old)
+    if block:
+        lines += block.split("\n") + [""]
+    lines += [f"🔗 {final_link}", "", f"✅ Preço encontrado: **R$ {brl(price)}**"]
+    send_message("\n".join(lines), chat_id=chat_id, photo_url=image or None, reply_to=message_id)
+
+    product = {"id": "pv_" + hashlib.md5(final_link.encode()).hexdigest()[:10],
+               "title": title, "price": price, "original_price": old,
+               "permalink": final_link, "thumbnail": image, "source": "privado"}
+    LAST_PRODUCT[chat_id] = product
+
+    if text.startswith("/canal"):
+        publish(product)
+        send_message("✅ Publicado no canal.", chat_id=chat_id, reply_to=message_id)
+    else:
+        send_message("💡 Use `/canal` para publicar este produto no canal.",
+                     chat_id=chat_id, reply_to=message_id)
+
+
+def _handle_private_async(message):
+    """Roda o tratamento numa thread para não travar o long polling."""
+    try:
+        handle_private_message(message)
+    except Exception as exc:
+        log(f"⚠️ Erro ao tratar mensagem privada: {type(exc).__name__}: {exc}")
+
+
+def private_listener():
+    """Escuta o chat privado via long polling da Bot API."""
+    if not TELEGRAM_TOKEN:
+        return
+    log("👂 Escutador do chat privado iniciado.")
+    offset = load_json(OFFSET_FILE, 0)
+    offset = int(offset or 0)
+
+    if not offset:
+        try:
+            pending = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                                   params={"offset": 0, "limit": 1, "timeout": 0},
+                                   timeout=25).json().get("result", [])
+            offset = pending[-1]["update_id"] + 1 if pending else 0
+        except Exception:
+            offset = 0
+        if offset:
+            save_json(OFFSET_FILE, offset)
+            log(f"   Offset inicial: {offset} (mensagens antigas ignoradas)")
+
+    while True:
+        try:
+            resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                                params={"offset": offset, "timeout": 30}, timeout=60)
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+
+            for update in resp.json().get("result", []):
+                offset = update["update_id"] + 1
+                message = update.get("message") or update.get("edited_message")
+                if not message:
+                    continue
+                chat = message.get("chat") or {}
+                if chat.get("type") != "private":
+                    continue
+                threading.Thread(target=_handle_private_async, args=(message,),
+                                 daemon=True).start()
+
+            if offset:
+                save_json(OFFSET_FILE, offset)
+        except Exception as exc:
+            log(f"⚠️ Listener privado: {type(exc).__name__}: {exc}")
+            time.sleep(5)
+
+
+# --------------------------------------------------------------------------
+# Monitoramento de canais
+# --------------------------------------------------------------------------
+
+def channel_listener():
+    """Espelha ofertas de canais do Telegram. Opcional: requer telethon + sessão já autenticada."""
+    api_id, api_hash = env("API_ID"), env("API_HASH")
+    if not SOURCE_CHANNELS:
+        return
+    if not (api_id.isdigit() and api_hash):
+        log("⏭️  Monitoramento de canais desativado (API_ID/API_HASH ausentes ou inválidos).")
+        return
+    try:
+        import asyncio
+        from telethon import TelegramClient, events
+    except Exception:
+        log("⏭️  Telethon não instalado — monitoramento de canais desativado.")
+        return
+
+    session_path = str(BASE_DIR / "session_promos")
+    session_file = Path(session_path + ".session")
+
+    async def run():
+        client = TelegramClient(session_path, int(api_id), api_hash)
+
+        if "--login" in sys.argv or not session_file.exists():
+            if not session_file.exists() and "--login" not in sys.argv:
+                log("⚠️ Telethon: sem sessão local. Rode  python bot.py --login  uma vez "
+                    "para habilitar o monitoramento dos canais.")
+                return
+            log("🔐 Autenticando no Telethon (informe o telefone e o código)…")
+            await client.start()
+            log("✅ Sessão criada. Reinicie o bot para usar o monitoramento.")
+            await client.disconnect()
+            return
+
+        await client.connect()
+        if not await client.is_user_authorized():
+            log("⚠️ Telethon: sessão expirada. Rode  python bot.py --login  novamente.")
+            await client.disconnect()
+            return
+
+        @client.on(events.NewMessage(chats=SOURCE_CHANNELS))
+        async def handler(event):
+            raw = event.raw_text or ""
+            if len(raw) < 15:
+                return
+
+            urls = re.findall(r"https?://[^\s]+", raw)
+            product_urls = [u for u in urls if is_product_url(u)]
+            if not product_urls:
+                return
+
+            # 1. Substitui TODOS os links pelos links com o seu codigo de afiliado
+            affiliate_urls = {u: affiliate_link(u.rstrip(".,)")) for u in urls}
+            text = raw
+            for original, tagged in affiliate_urls.items():
+                text = text.replace(original, tagged)
+            link = affiliate_urls[product_urls[0].rstrip(".,)")]
+
+            # 2. Preco: usa o que veio no texto, senao extrai da pagina do produto
+            match = re.search(r"R\$\s*([\d\.]+,\d{2})", raw)
+            price = parse_money(match.group(1)) if match else None
+
+            # 3. Foto: usa a do post, senao extrai da pagina do produto
+            image = None
+            if event.photo:
+                try:
+                    path = await event.download_media()
+                    if path:
+                        image = upload_to_blob(path, f"canal_{int(time.time())}.jpg")
+                        Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            title = ""
+            if not image or not price:
+                data = extract_product(product_urls[0])
+                title = data.get("title") or ""
+                image = image or (data.get("image") or "")
+                price = price or data.get("price")
+
+            if not title:
+                lines = [l.strip() for l in raw.split("\n") if l.strip()]
+                title = lines[0][:150] if lines else "Oferta"
+
+            # 4. Monta o post com o preco quando ele nao veio no texto original
+            if price and not match:
+                text = f"{title}\n\n{price_block(price, None)}\n\n{text}"
+
+            log(f"📡 Canal: {title[:45]} | foto={'sim' if image else 'nao'} | preco={brl(price)}")
+            send_message(f"{text}\n\n{FOOTER_TEXT}", photo_url=image)
+            save_to_vitrine({"id": "ch_" + hashlib.md5(link.encode()).hexdigest()[:10],
+                             "title": title, "price": price, "original_price": None,
+                             "link": link, "image": image or ""})
+
+        log(f"👂 Telethon conectado: {', '.join(SOURCE_CHANNELS)}")
+        try:
+            await client.run_until_disconnected()
+        finally:
+            await client.disconnect()
+
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        log(f"⚠️ Telethon: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Ciclos programados
+# --------------------------------------------------------------------------
+
+def telegram_cycle():
+    log("\n🤖 Ciclo do Telegram: planilha + raspagem")
+    BLOCKED_SOURCES.clear()
+    proxy_health()
+    seen = load_json(SEEN_FILE)
+    products = collect_products(include_scrape=True)
+
+    new_sheet = [p for p in products if p["source"] == "planilha" and p["id"] not in seen]
+    if new_sheet:
+        log(f"📊 {len(new_sheet)} produto(s) novo(s) da planilha.")
+        for product in new_sheet:
+            publish(product, announce_instagram=True)
+            time.sleep(8)
+    else:
+        log("📊 Nenhum produto novo na planilha.")
+
+    sent = 0
+    for product in [p for p in products if p["id"] not in seen]:
+        if sent >= POSTS_PER_CYCLE:
+            break
+        if publish(product, announce_instagram=True):
+            sent += 1
+            time.sleep(8)
+    log(f"✅ Ciclo concluído: {sent} oferta(s) da raspagem publicada(s).\n")
+
+
+def instagram_cycle():
+    queue = load_json(BASE_DIR / "ig_queue.json", [])
+    if not queue:
+        log("📸 Instagram: fila vazia.")
+        return
+    item = queue[0]
+    pct = item.get("pct")
+    caption = f"🔥 {item['title']}\n\n{price_block(item.get('price'), item.get('old'))}\n\n🔗 Link na bio!"
+    public_url = arte_para_publicar(item.get("image"), item.get("price"), item.get("old"), pct, item.get("title"))
+    if post_to_instagram(public_url, caption):
+        save_json(BASE_DIR / "ig_queue.json", queue[1:])
+    else:
+        log("⏭️ Post do Instagram não concluído; item mantido na fila.")
+
+
+def main():
+    log("=" * 52)
+    log(">>> BOT VAGANTE PROMOÇÕES <<<")
+    log("=" * 52)
+
+    if "--login" in sys.argv:
+        log("🔐 Modo de autenticação do Telethon — informe telefone e código quando solicitado.")
+        channel_listener()
+        return
+
+    if not check_credentials():
+        return
+    resolve_ig_user_id()
+    if not HAVE_CURL_CFFI:
+        log("⚠️ curl_cffi ausente — a raspagem pode ser bloqueada. Instale com: pip install curl_cffi")
+    if PROXIES:
+        proxy_health()
+    else:
+        log("⚠️ Sem PROXY no .env — Mercado Livre e Shopee bloqueiam este IP e não retornam produtos.")
+    if not TEMPLATE_FILE.exists():
+        log("ℹ️  Sem template.png — será usado o card gerado automaticamente.")
+
+    if "--once" in sys.argv:
+        telegram_cycle()
+        instagram_cycle()
+        log("✅ Execução única concluída.")
+        return
+
+    threading.Thread(target=private_listener, daemon=True).start()
+    threading.Thread(target=channel_listener, daemon=True).start()
+
+    last_telegram = 0.0
+    last_instagram = 0.0
+    time.sleep(5)
+
+    while True:
+        try:
+            now = time.time()
+            if now - last_telegram >= INTERVAL_TELEGRAM:
+                telegram_cycle()
+                last_telegram = now
+            if now - last_instagram >= INTERVAL_INSTAGRAM:
+                instagram_cycle()
+                last_instagram = now
+        except Exception as exc:
+            log(f"⚠️ Erro no ciclo principal: {exc}")
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Encerrado pelo usuário.")
+        sys.exit(0)
