@@ -5,6 +5,198 @@
 
 ---
 
+## [2026-10-14 15:10] — Sessão 11: `resolve_store_link` implementado (link de loja vira link de produto)
+
+**Objetivo:** o usuário aprovou ("se isso for resolver, sim") implementar a
+resolução de link de loja do ML, que faltava desde a sessão 10.
+
+**Arquivos alterados:**
+- `bot.py` — 6 funções novas + `affiliate_link` integrado + handler do
+  Telethon reordenado
+- `LLM/CHANGELOG.md`, `LLM/ISSUES.md`, `LLM/PROJECT_STATE.md` — esta sessão
+
+### O que foi implementado
+
+Portado do bytecode da versão perdida (`RECOVERY_bot_py.md`):
+
+| Função | O que faz |
+|---|---|
+| `_keywords(text)` | tokeniza, tira acento (`_ACCENTS`) e remove `STOP_WORDS` |
+| `_ml_price(card)` | preço do card via `.andes-money-amount__fraction` + `__cents` |
+| `_ml_product_url(href)` | canônico `/<slug>/p/MLB<id>`, preserva `pdp_filters`/`searchVariation`, joga fora **todo** rastreamento (`matt*`) |
+| `store_catalog(url)` | lê `/social/<user>`, cache 5 min, retorna `[{title, price, url, image}]` |
+| `resolve_store_link(url, price, title)` | casa o produto por **preço (8% de folga) + similaridade de título** |
+
+Novas constantes: `RESOLVE_STORE_LINKS` (default `1`), `STOP_WORDS`,
+`_ACCENTS`, `ML_PRODUCT_RE`.
+
+### Ajuste no handler do Telethon
+
+O preço e o título agora são lidos **antes** de montar os links (antes eram
+depois). Sem isso o `resolve_store_link` receberia `price=None, title=None`
+e nunca acharia o produto — justamente o caso dos canais `@linksBrazil` e
+`@xetdaspromocoes`, que mandam encurtado de loja.
+
+### Scoring
+
+```python
+price_ok = abs(item.price - price) / price <= 0.08
+title_score = |palavras em comum| / |palavras do título|
+score = 2.0 + title_score   se preço bateu
+      = 2.0 * title_score   se só o título (100% de match aprova)
+aceita se best_score >= 2
+```
+
+> A primeira versão dava no máximo 1.5 ponto sem preço, ou seja **só título
+> nunca aprovava**. Corrigido no teste (c).
+
+### ✅ Verificado contra a loja REAL
+
+`https://www.mercadolivre.com.br/social/linksbrazil` — **não é bloqueada**
+(HTTP 200, sem bot-wall, 19 `.poly-card`).
+
+```
+R$  199,90  Proteína Black Skull Whey 100% Hd Em Pó Sabor Baunil
+R$  329,40  Headset Gamer Wireless Warrior - Ph704 Preto
+R$  100,00  Valorant R$100 (digital)
+R$  150,00  Uber Gift Card R$150 (digital)
+R$   86,00  Colônia Natura #urbano Masculino 100ml
+R$  88,22  Kit 3 Fans Tgt Striker Rainbow 120mm
+```
+
+| Teste | Resultado |
+|---|---|
+| (a) preço + título exatos | ✅ achou o produto certo |
+| (b) preço perturbado +3% | ✅ achou |
+| (c) só título, sem preço | ✅ achou |
+| (d) título sem relação | ✅ não achou (não inventa) |
+
+### O resultado final, com o link da foto
+
+**Antes:**
+```
+https://meli.la/1w4qNk3?matt_word=coth8154082&matt_tool=20122674
+```
+→ link curto, vai para a loja do outro afiliado, **não paga**.
+
+**Agora:**
+```
+https://www.mercadolivre.com.br/produto/p/MLB72006876?matt_word=coth8154082&matt_tool=20122674
+```
+→ link de **produto** com a tag do usuário. **Paga comissão.**
+
+**Sintaxe validada** com `py_compile`. Nada foi publicado.
+
+### ⚠️ Limites conhecidos
+
+- Só a **primeira página** do catálogo da loja é lida (19 itens). Lojas com
+  mais produtos podem precisar de paginação.
+- Se o preço do canal não bater com nenhum item e o título não for
+  conclusivo, a oferta é descartada e o dono é avisado (comportamento
+  seguro — melhor que postar link quebrado).
+- A loja é cacheada por 5 min; se o canal mandar o mesmo link várias vezes
+  em sequência, o custo cai bastante.
+
+**Resultado:**
+- ✅ Link de loja agora vira link de produto que paga comissão
+- ✅ Tag de outro afiliado removida em todos os caminhos
+- ✅ Testado contra a loja real, 4/4
+
+---
+
+## [2026-10-14 14:55] — Sessão 10: link encurtado não era expandido (bug de método HTTP)
+
+**Objetivo:** o usuário mandou a 2ª foto (`E:\Pasta de erro\2.jpeg`, 14:43)
+mostrando posts no canal com:
+```
+https://meli.la/1w4qNk3?matt_word=coth8154082&matt_tool=20122674
+```
+e reclamando: *"o link não esta sendo decifrado novamente. Esta pegando o
+link encurtado e pondo minhas tags. o que não adianta pois envia o link de
+outra loja"*.
+
+### 🔴 CAUSA RAIZ — não é bloqueio de IP. É método HTTP.
+
+`expand_url()` usava **`requests.head()`**. O encurtador do ML **não responde
+a HEAD**:
+
+| URL | HEAD | GET |
+|---|---|---|
+| `https://meli.la/1w4qNk3` | **HTTP 405** (não expande) | **HTTP 200 → expande** |
+| `https://shope.ee/2VdqXs` | HTTP 200 mas cai em `/error_page` | — |
+| `https://a.co/d/abc123` | HTTP 404 | — |
+
+E como 405 **não é exceção**, o `except` que fazia o fallback para GET
+**nunca era executado** — era código morto. Resultado: `expand_url` devolvia
+o próprio link curto, o `affiliate_link` caía no fallback e colocava a tag em
+cima do `meli.la`.
+
+### 🔴 E o link expandido é uma LOJA (confirma a complaint)
+
+`GET` em `meli.la/1w4qNk3` dá:
+```
+https://www.mercadolivre.com.br/social/linksbrazil
+  ?matt_word=linksbr&matt_tool=17783195&forceInApp=true&...
+```
+
+Duas coisas:
+1. É `/social/` = **link de LOJA**, que **ignora tag de afiliado**.
+2. Traz a tag de **outro afiliado** (`matt_word=linksbr`) — precisa ser removida.
+
+É literalmente "envia o link de outra loja". É o caso que a versão perdida
+tratava com `is_store_link` + `resolve_store_link`.
+
+### Correções aplicadas no `bot.py`
+
+1. **`expand_url` reescrito** — tenta `GET` direto → `GET` via proxy → `HEAD`
+   via proxy. Usa `curl_cffi` quando disponível, cache de 15 min (`URL_CACHE`)
+   e detecção de bot-wall (`_is_bot_wall`).
+2. **`strip_params(url, keys)`** — novo. Remove tags de quem já tinha
+   compartilhado o link:
+   - ML: `matt_word`, `matt_tool`, `matt`, `forceInApp`, `ref`
+   - Shopee: `smtt`, `sp_atk`, `is_from_webapp`
+   - Amazon: `tag`, `ascsubtag`, `th`, `psc`
+3. **`is_store_link(url)`** — novo. Detecta `/social/`, `/loja/`, `/store/`,
+   `linksbrazil`.
+4. **`affiliate_link` agora devolve `(link, aviso)`** — quando o link é de
+   loja, **não coloca a tag** (seria mentira) e devolve um aviso.
+5. **`notify_admin()`** — nova (usa `ADMIN_CHAT_ID`). O espelho de canal
+   agora **descarta** a oferta de loja e avisa o dono em vez de postar link
+   quebrado.
+6. Call sites atualizados: `publish`, `/buscar`, `/canal`, link solto e o
+   handler do Telethon.
+
+### Testado com os links reais da foto
+
+| Caso | Antes | Depois |
+|---|---|---|
+| `meli.la/1w4qNk3` | `meli.la/1w4qNk3?matt_word=...` (não paga) | expandido → detectado como loja → **descartado com aviso** |
+| `meli.la/2JGUTrm` | idem | idem |
+| ML direto `/produto/MLB…` | ✅ | ✅ com tag |
+| link com tag de outro afiliado | mantinha `matt_word=linksbr` | **tag removida** |
+
+**Sintaxe validada** com `py_compile`.
+
+### ⚠️ Impacto no comportamento — ATENÇÃO
+
+Os canais monitorados são `@linksBrazil` e `@xetdaspromocoes`. Os links
+`meli.la` deles apontam para a **loja** `/social/linksbrazil`. Com esta
+correção o bot vai **parar de postar** essas ofertas (por enquanto), porque
+não há como gerar comissão nelas.
+
+**Falta a Fase 2:** reimplementar `resolve_store_link()` (da versão perdida)
+— lê o catálogo da loja e acha o produto por **preço + similaridade de
+título**, aí sim gerando o link de produto que paga. São ~120 linhas e a
+spec está em `RECOVERY_bot_py.md`.
+
+**Resultado:**
+- ✅ Por que o link não era decifrado: identificado e corrigido
+- ✅ Tag de outro afiliado removida
+- ✅ O bot não posta mais link que não paga — avisa o dono
+- ⏳ `resolve_store_link` (achar o produto dentro da loja) ainda falta
+
+---
+
 ## [2026-10-14 14:50] — Sessão 9: 2ª foto do Termux — correção do proxy funcionou, 3 pendências
 
 **Objetivo:** o usuário mandou nova foto (`E:\Pasta de erro\1.jpeg`, 14/10 14:35)

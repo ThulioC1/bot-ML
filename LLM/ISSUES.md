@@ -94,6 +94,39 @@ causa. Baixa prioridade.
 
 ---
 
+---
+
+## [RESOLVIDA · 2026-10-14] Link encurtado nunca era expandido
+
+`expand_url()` usava `requests.head()`, e o encurtador do ML responde
+**HTTP 405** a HEAD. Como 405 não é exceção, o fallback para GET era código
+morto. → `meli.la` continuava curto e a tag ia por cima dele.
+
+**Corrigido na sessão 10:** `GET` direto → `GET` via proxy → `HEAD` via proxy.
+
+## [RESOLVIDA · 2026-10-14] Tag de outro afiliado não era removida
+
+Links de origem já traziam `matt_word=linksbr&matt_tool=17783195`.
+**Corrigido:** `strip_params()` remove `matt_word`, `matt_tool`, `matt`,
+`forceInApp`, `ref` (e equivalentes de Shopee/Amazon) antes de aplicar a
+nossa tag.
+
+## [RESOLVIDA · 2026-10-14] `resolve_store_link` — link de loja vira link de produto
+
+Link `meli.la` dos canais monitorados expande para
+`www.mercadolivre.com.br/social/linksbrazil` — link de LOJA, que ignora
+tag de afiliado.
+
+**Implementado na sessão 11.** 6 funções portadas do bytecode, testadas
+contra a loja real (`/social/linksbrazil`, 19 produtos, não é bloqueada).
+4/4 testes passaram. O link agora sai como
+`/produto/p/MLB72006876?matt_word=...&matt_tool=...`.
+
+**Limites:** só a primeira página do catálogo (19 itens); cache de 5 min.
+Se não achar, a oferta é descartada e o dono avisado.
+
+---
+
 ## [ABERTA · CRÍTICA] Mercado Livre bloqueia o IP residencial (bot-wall)
 
 14/10 14:35, no celular:

@@ -254,18 +254,223 @@ def brl(value):
     return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+BOT_WALL_MARKERS = ("account-verification", "suspicious-traffic", "recaptcha",
+                    "/gz/", "/captcha", "challenge.oray")
+URL_CACHE = {}
+
+# Tags de afiliado que podem ja estar no link de origem (de outro afiliado).
+ML_OWN_TAGS = ("matt_word", "matt_tool", "matt", "forceInApp", "ref")
+SHOPEE_OWN_TAGS = ("smtt", "sp_atk", "is_from_webapp")
+AMAZON_OWN_TAGS = ("tag", "ascsubtag", "th", "psc")
+
+# Resolucao de link de LOJA do ML: /social/ ignora a tag, entao precisa achar
+# o produto de verdade dentro do catalogo da loja.
+RESOLVE_STORE_LINKS = env("RESOLVE_STORE_LINKS", "1").strip().lower() not in ("0", "false", "nao", "não")
+STOP_WORDS = frozenset({
+    "frete", "e", "do", "em", "original", "kit", "o", "das", "de", "a", "dos", "da",
+    "oferta", "peca", "peças", "r$", "gratis", "grátis", "promocao", "promoção",
+    "promo", "para", "com", "unidades", "un",
+})
+_ACCENTS = {ord(c): None for c in "áàâãäéêíìîóôõöúüçÁÀÂÃÄÉÊÍÌÎÓÔÕÖÚÜÇ"}
+ML_PRODUCT_RE = re.compile(r"MLB-?(\d{6,})(?:-(.+))?", re.IGNORECASE)
+
+
+def _is_bot_wall(text):
+    low = (text or "").lower()
+    return any(marker in low for marker in BOT_WALL_MARKERS)
+
+
 def expand_url(url):
-    try:
-        resp = requests.head(url, allow_redirects=True, timeout=8,
-                             headers={"User-Agent": BROWSER_UA}, proxies=PROXIES)
-        return resp.url or url
-    except Exception:
+    """Resolve encurtadores (meli.la, shope.ee, amzn.to, a.co).
+
+    IMPORTANTE: encurtador nao responde a HEAD. O meli.la devolve 405 e o
+    shope.ee cai em pagina de erro; so o GET segue o redirecionamento.
+    Por isso a ordem e GET primeiro e HEAD so como ultimo recurso.
+    """
+    if not url:
+        return url
+    cached = URL_CACHE.get(url)
+    if cached and time.time() - cached[0] < 900:
+        return cached[1]
+
+    client = cureq if HAVE_CURL_CFFI else requests
+    attempts = (("get", None), ("get", PROXIES), ("head", PROXIES))
+    resolved = None
+    for method, proxy in attempts:
+        if proxy is None and PROXIES:
+            continue  # com proxy configurado, nem tenta a conexao direta
+        call = client.head if method == "head" else client.get
         try:
-            resp = requests.get(url, allow_redirects=True, timeout=8, stream=True,
-                                headers={"User-Agent": BROWSER_UA}, proxies=PROXIES)
-            return resp.url or url
+            resp = call(url, allow_redirects=True, timeout=10, stream=True,
+                        headers={"User-Agent": BROWSER_UA}, proxies=proxy)
+            final = resp.url or url
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if _is_bot_wall(final):
+                continue
+            if final != url and final.startswith("http"):
+                resolved = final
+                break
         except Exception:
-            return url
+            continue
+
+    resolved = resolved or url
+    URL_CACHE[url] = (time.time(), resolved)
+    if resolved != url:
+        log(f"🔗 Link expandido: {url[:42]} -> {resolved[:72]}")
+    return resolved
+
+
+def strip_params(url, keys):
+    """Remove params de afiliado que ja estavam no link de origem."""
+    parsed = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    for key in keys:
+        params.pop(key, None)
+    query = urllib.parse.urlencode(params, doseq=True)
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment)
+    )
+
+
+def is_store_link(url):
+    """Link de LOJA do ML (/social/, /loja/, /store/) ignora a tag de afiliado."""
+    low = (url or "").lower()
+    return any(p in low for p in ("/social/", "/loja/", "/store/", "linksbrazil"))
+
+
+def _keywords(text):
+    """Palavras-chave do titulo, sem acento e sem palavra de parada."""
+    clean = (text or "").lower().translate(_ACCENTS)
+    return {w for w in re.findall(r"[a-z0-9]{3,}", clean) if w not in STOP_WORDS}
+
+
+def _ml_price(card):
+    """Preco atual de um card da listagem. Recebe o ELEMENTO, nao o texto."""
+    if card is None:
+        return None
+    try:
+        el = card.select_one(".andes-money-amount__fraction, .poly-price__current")
+        if not el:
+            return None
+        frac = el.get_text(strip=True).replace(".", "").replace(",", "")
+        cents_el = card.select_one(".andes-money-amount__cents")
+        cents = cents_el.get_text(strip=True).replace(",", ".") if cents_el else "00"
+        return parse_money(f"{frac}.{cents}")
+    except Exception:
+        return None
+
+
+def _ml_product_url(href):
+    """Link canonico de produto /<slug>/p/MLB<id>, preservando os params do ML."""
+    if not href:
+        return None
+    if href.startswith("//"):
+        href = "https:" + href
+    elif href.startswith("/"):
+        href = "https://www.mercadolivre.com.br" + href
+    match = ML_PRODUCT_RE.search(href)
+    if not match:
+        return None
+    catalog = match.group(1)
+    slug = re.sub(r"[^a-z0-9-]+", "-", (match.group(2) or "produto").lower()).strip("-")
+    slug = (slug[:60] or "produto")
+    parsed = urllib.parse.urlparse(href)
+    url = f"https://www.mercadolivre.com.br/{slug}/p/MLB{catalog}"
+    if parsed.query:
+        # preserva o que o proprio ML usa (pdp_filters, searchVariation...)
+        # mas joga fora QUALQUER rastreamento de afiliado, inclusive matt_*
+        keep = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()
+                if k not in ML_OWN_TAGS and not k.lower().startswith("matt")}
+        if keep:
+            url = append_query(url, keep)
+    return url
+
+
+def store_catalog(store_url):
+    """Le o catalogo da loja (/social/user) e devolve [{title, price, url, image}]."""
+    if not store_url:
+        return []
+    cache_key = "cat::" + strip_params(store_url, list(ML_OWN_TAGS))
+    cached = URL_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < 300:
+        return cached[1]
+
+    resp = http_get(store_url, timeout=25)
+    items = []
+    if resp is not None and resp.status_code == 200 and not _is_bot_wall(resp.text[:3000]):
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for card in soup.select(".poly-card"):
+            try:
+                anchor = card.select_one("a.poly-card__title-anchor, h2 a[href], a[href]")
+                if not anchor:
+                    continue
+                href = (anchor.get("href") or "").split("#")[0]
+                product_url = _ml_product_url(href)
+                if not product_url:
+                    continue
+                title_el = card.select_one(".poly-component__title, h2")
+                title = title_el.get_text(strip=True) if title_el else anchor.get("title", "")
+                price = _ml_price(card)
+                img = card.select_one("img")
+                image = ""
+                if img:
+                    image = (img.get("data-src") or img.get("data-zoom") or img.get("src") or "")
+                if title and price:
+                    items.append({"title": title, "price": price,
+                                  "url": product_url, "image": image})
+            except Exception:
+                continue
+    URL_CACHE[cache_key] = (time.time(), items)
+    log(f"📦 Catálogo da loja: {len(items)} produto(s)")
+    return items
+
+
+def resolve_store_link(store_url, price=None, title=None):
+    """Acha o produto da loja que bate com o preco/titulo da oferta.
+
+    Sem isso o link encurtado leva o visitante para a LOJA de outro afiliado e
+    a sua tag nao e creditada - por isso a busca.
+    """
+    if not RESOLVE_STORE_LINKS:
+        return None
+    items = store_catalog(store_url)
+    if not items:
+        return None
+
+    wanted = _keywords(title)
+    best, best_score = None, 0.0
+    for item in items:
+        words = _keywords(item.get("title"))
+        title_score = 0.0
+        if wanted and words:
+            common = len(wanted & words)
+            if common:
+                title_score = common / max(len(wanted), 1)
+
+        price_ok = False
+        if price and item.get("price"):
+            price_ok = abs(item["price"] - price) / price <= 0.08   # 8% de folga
+
+        if price_ok:
+            score = 2.0 + title_score          # preco manda; titulo desempata
+        elif title_score >= 0.5:
+            score = 2.0 * title_score          # so titulo: 100% de match aprova
+        else:
+            continue
+        if score > best_score:
+            best, best_score = item, score
+
+    if best is None or best_score < 2:
+        return None
+    if price and best.get("price"):
+        log(f"🔗 Link de loja resolvido para o produto: {best['title'][:50]} "
+            f"(R$ {brl(best['price'])} | bateu {best_score:.2f})")
+    else:
+        log(f"🔗 Link de loja resolvido por título: {best['title'][:60]}")
+    return best
 
 
 # --------------------------------------------------------------------------
@@ -301,48 +506,63 @@ def is_product_url(url):
     return any(domain in url.lower() for domain in MARKETPLACES)
 
 
-def affiliate_link(url):
-    """Aplica o identificador de afiliado conforme o marketplace."""
+def affiliate_link(url, price=None, title=None):
+    """Aplica o identificador de afiliado conforme o marketplace.
+
+    Devolve (link, aviso). O aviso e preenchido quando o link foi expandido
+    mas aponta para uma LOJA — que ignora a tag de afiliado, ou seja, nao
+    gera comissao. Nesse caso `link` vem sem tag para naoIludir ninguem.
+    """
     if not url:
-        return url
+        return url, ""
     url = url.rstrip(".,)")
     low = url.lower()
+    aviso = ""
 
-    # meli.la e link encurtado do ML. Se conseguir expandir, aplica no link final;
-    # se nao conseguir (ML bloqueando este IP), aplica direto no meli.la, que
-    # tambem aceita os parametros de afiliado.
-    if "meli.la" in low:
-        tracking = {"matt_word": ML_MATT_WORD, "matt_tool": ML_MATT_TOOL} if (ML_MATT_WORD and ML_MATT_TOOL) else {}
+    # ---- Mercado Livre (inclui meli.la, amzn-like encurtado) ----
+    if "meli.la" in low or "mercadolivre" in low or "mercadolibre" in low:
+        tracking = ({"matt_word": ML_MATT_WORD, "matt_tool": ML_MATT_TOOL}
+                    if (ML_MATT_WORD and ML_MATT_TOOL) else {})
         expanded = expand_url(url)
-        if expanded and "mercadolivre" in expanded.lower():
-            return append_query(expanded, tracking) if tracking else expanded
-        return append_query(url, tracking) if tracking else url
+        if expanded != url:
+            url = expanded
+            low = url.lower()
+        # tira a tag de afiliado de quem ja tinha sharing o link
+        url = strip_params(url, list(ML_OWN_TAGS))
+        low = url.lower()
 
-    if "mercadolivre" in low or "mercadolibre" in low:
-        if not (ML_MATT_WORD and ML_MATT_TOOL):
-            return url
-        return append_query(url, {"matt_word": ML_MATT_WORD, "matt_tool": ML_MATT_TOOL})
+        if is_store_link(url):
+            item = resolve_store_link(url, price, title)
+            if item:
+                return append_query(item["url"], tracking), ""
+            aviso = (f"⛔ link de LOJA do ML ({urllib.parse.urlparse(url).path}) "
+                     f"ignora a tag de afiliado — nao gera comissao sua.")
+            return url, aviso
+        if not tracking:
+            return url, "⛔ ML_MATT_WORD/ML_MATT_TOOL ausentes no .env."
+        return append_query(url, tracking), aviso
 
+    # ---- Shopee (inclui shope.ee / s.shopee.com) ----
     if "shopee" in low or "shope.ee" in low:
-        if "s.shopee.com" in low or "shope.ee" in low:
-            expanded = expand_url(url)
-            if expanded and "shopee" in expanded.lower():
-                url = expanded
-                low = url.lower()
+        expanded = expand_url(url)
+        if expanded != url:
+            url = expanded
+        url = strip_params(url, list(SHOPEE_OWN_TAGS))
         if not SHOPEE_TAG:
-            return url
-        return append_query(url, {"smtt": SHOPEE_TAG})
+            return url, "⛔ SHOPEE_TAG ausente no .env."
+        return append_query(url, {"smtt": SHOPEE_TAG}), aviso
 
+    # ---- Amazon (inclui amzn.to / a.co) ----
     if "amazon" in low or "amzn.to" in low or "a.co" in low:
-        if "amzn.to" in low or "a.co" in low:
-            expanded = expand_url(url)
-            if expanded and "amazon" in expanded.lower():
-                url = expanded
+        expanded = expand_url(url)
+        if expanded != url:
+            url = expanded
+        url = strip_params(url, list(AMAZON_OWN_TAGS))
         if not AMAZON_TAG:
-            return url
-        return append_query(url, {"tag": AMAZON_TAG})
+            return url, "⛔ AMAZON_TAG ausente no .env."
+        return append_query(url, {"tag": AMAZON_TAG}), aviso
 
-    return url
+    return url, aviso
 
 
 # --------------------------------------------------------------------------
@@ -407,6 +627,17 @@ def download_image(url, timeout=25):
         return path
     except Exception:
         return None
+
+
+def notify_admin(text):
+    """Avisa o dono no privado (ADMIN_CHAT_ID). Silencioso se nao configurado."""
+    chat_id = env("ADMIN_CHAT_ID")
+    if not chat_id:
+        return
+    try:
+        tg_api("sendMessage", {"chat_id": chat_id, "text": f"🤖 {text}"})
+    except Exception:
+        pass
 
 
 def send_message(text, chat_id=None, photo_url=None, reply_to=None):
@@ -1111,13 +1342,15 @@ def save_to_vitrine(item):
 def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
     price = product.get("price")
     old = product.get("original_price")
-    link = affiliate_link(product["permalink"])
+    link, aviso = affiliate_link(product["permalink"], price, product.get("title"))
     title = product.get("title") or "Oferta Especial"
 
     lines = ["🔥 OFERTA EM DESTAQUE", "", f"📦 {title}", ""]
     block = price_block(price, old)
     if block:
         lines += block.split("\n") + [""]
+    if aviso:
+        lines += [aviso, ""]
     lines += [f"🛒 Link: {link}"]
     if chat_id is None:
         lines += ["", FOOTER_TEXT]
@@ -1215,7 +1448,7 @@ def handle_private_message(message):
         blocks = []
         for p in results:
             block = price_block(p.get("price"), p.get("original_price")) or "💰 ver preço no link"
-            blocks.append(f"📦 {p['title'][:80]}\n{block}\n🔗 {affiliate_link(p['permalink'])}")
+            blocks.append(f"📦 {p['title'][:80]}\n{block}\n🔗 {affiliate_link(p['permalink'])[0]}")
         send_message("\n\n".join(blocks), chat_id=chat_id, reply_to=message_id)
         return
 
@@ -1236,7 +1469,7 @@ def handle_private_message(message):
                          "sozinho para publicar o ultimo.",
                          chat_id=chat_id, reply_to=message_id)
             return
-        publish({**last, "permalink": affiliate_link(last["permalink"])})
+        publish({**last, "permalink": affiliate_link(last["permalink"])[0]})
         send_message(f"✅ Publicado no canal: {last['title'][:60]}",
                      chat_id=chat_id, reply_to=message_id)
         return
@@ -1258,7 +1491,7 @@ def handle_private_message(message):
     old = None if forced_price is not None else data.get("original_price")
     title = data.get("title") or "Oferta Especial"
     image = data.get("image") or ""
-    final_link = affiliate_link(data.get("link") or url)
+    final_link, link_aviso = affiliate_link(data.get("link") or url, price, title)
 
     if price is None:
         send_message(
@@ -1397,17 +1630,30 @@ def channel_listener():
             product_urls = [u for u in urls if is_product_url(u)]
             if not product_urls:
                 return
+            link_aviso = ""
 
-            # 1. Substitui TODOS os links pelos links com o seu codigo de afiliado
-            affiliate_urls = {u: affiliate_link(u.rstrip(".,)")) for u in urls}
+            # 1. Preco e titulo sao lidos ANTES de montar os links: o link de
+            # loja so vira link de produto se a busca souber o que procurar.
+            match = re.search(r"R\$\s*([\d\.]+,\d{2})", raw)
+            price = parse_money(match.group(1)) if match else None
+            _lines = [l.strip() for l in raw.split("\n") if l.strip()]
+            title_guess = ""
+            for l in _lines:
+                if len(l) > 12 and "http" not in l and not l.startswith("-"):
+                    title_guess = l[:150]
+                    break
+
+            # 2. Substitui TODOS os links pelos links com o seu codigo de afiliado
+            affiliate_urls = {}
+            for u in urls:
+                tagged, av = affiliate_link(u.rstrip(".,)"), price, title_guess)
+                affiliate_urls[u] = tagged
+                if av and u.rstrip(".,)") == product_urls[0].rstrip(".,)"):
+                    link_aviso = av
             text = raw
             for original, tagged in affiliate_urls.items():
                 text = text.replace(original, tagged)
             link = affiliate_urls[product_urls[0].rstrip(".,)")]
-
-            # 2. Preco: usa o que veio no texto, senao extrai da pagina do produto
-            match = re.search(r"R\$\s*([\d\.]+,\d{2})", raw)
-            price = parse_money(match.group(1)) if match else None
 
             # 3. Foto: usa a do post, senao extrai da pagina do produto
             image = None
@@ -1428,14 +1674,18 @@ def channel_listener():
                 price = price or data.get("price")
 
             if not title:
-                lines = [l.strip() for l in raw.split("\n") if l.strip()]
-                title = lines[0][:150] if lines else "Oferta"
+                title = title_guess or (_lines[0][:150] if _lines else "Oferta")
 
             # 4. Monta o post com o preco quando ele nao veio no texto original
             if price and not match:
                 text = f"{title}\n\n{price_block(price, None)}\n\n{text}"
 
             log(f"📡 Canal: {title[:45]} | foto={'sim' if image else 'nao'} | preco={brl(price)}")
+            if link_aviso:
+                log(f"⚠️ {link_aviso}")
+                notify_admin(f"⚠️ Oferta do canal ignorada por comissao: "
+                             f"{link_aviso}\n{title[:70]}")
+                return
             send_message(f"{text}\n\n{FOOTER_TEXT}", photo_url=image)
             save_to_vitrine({"id": "ch_" + hashlib.md5(link.encode()).hexdigest()[:10],
                              "title": title, "price": price, "original_price": None,
