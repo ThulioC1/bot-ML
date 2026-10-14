@@ -162,6 +162,49 @@ celular): 49 produtos do `/ofertas`, 727 KB de HTML, sem parede anti-bot.
 
 **Falta testar em hardware Android** — o Chromium do Termux pode ter quirks.
 
+## [ABERTA · CRÍTICA] Chromium ainda não instalado no celular
+
+Comando **errado** na sessão 13 (minha culpa): `pkg install chromium-browser`
+não existe — esse é o nome do binário.
+
+**Comando certo:**
+```bash
+pkg update -y
+pkg install x11-repo
+pkg update -y
+pkg install chromium
+```
+
+Instala em `$PREFIX/bin/chromium-browser` (symlink) e
+`$PREFIX/lib/chromium/chrome` (binário real). O `chromium_binary()` já
+procura os dois.
+
+> Alternativa pelo `tur-repo` tem histórico de `CANNOT LINK EXECUTABLE`.
+
+Sem isso o `/ofertas` não abre e o bot usa só `/social/` (29 produtos em vez
+de ~48).
+
+## [ABERTA] `resolve_store_link` falha quando o canal não manda preço
+
+```
+📡 Canal: Jogo De Toalhas Buddemeyer Bella Extra Soft B | foto=sim | preco=
+⛔ link de LOJA do ML ... nao gera comissao sua.
+```
+
+Sem preço **e** sem título conclusivo, não há como achar o produto na loja.
+Comportamento seguro (não posta link quebrado), mas perde a oferta.
+
+**Ideia:** quando o preço não vem no texto, tenta extrair da imagem do post
+ou usar o título inteiro como match. Falta implementar.
+
+## [RESOLVIDA · 2026-10-14] Produto pequeno na arte
+
+`Image.thumbnail()` nunca amplia — só reduz. Substituído por `_fit_contain()`
+(amplia até 4x) + `_trim_margins()` (corta moldura branca do ML) + margem
+reduzida de 90 para 34px. Fundo trocado de navy→roxo para navy→azul escuro.
+
+---
+
 ## [ABERTA] `websocket-client` é dependência nova
 
 `pip install websocket-client` (python puro, compila em qualquer lugar).

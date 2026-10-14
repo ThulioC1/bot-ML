@@ -5,6 +5,146 @@
 
 ---
 
+## [2026-10-14 17:40] — Sessão 16: `pkg install chromium-browser` não existe
+
+**Objetivo:** o usuário rodou `pkg install chromium-browser` e recebeu
+**`E: Unable to locate package chromium-browser`**.
+
+### Causa: eu dei o nome errado
+
+`chromium-browser` é o **nome do BINÁRIO**, não do pacote. O pacote é
+`chromium` e mora no repositório opcional **`x11-packages`** (confirmado no
+`termux-packages/x11-packages/chromium/build.sh`).
+
+Instalado, ele cria:
+```
+$PREFIX/bin/chromium-browser   -> symlink para chromium-launcher.sh
+$PREFIX/lib/chromium/chrome         (binário real)
+$PREFIX/lib/chromium/headless_shell
+$PREFIX/bin/headless_shell
+$PREFIX/bin/chromedriver
+```
+
+Alternativa: `tur-repo` também tem `chromium` (binário pré-compilado), mas
+tem histórico de `CANNOT LINK EXECUTABLE` por símbolo — o do `x11-repo` é
+mais confiável.
+
+### Comando certo
+
+```bash
+pkg update -y
+pkg install x11-repo
+pkg update -y
+pkg install chromium
+```
+
+### Correções no `bot.py`
+
+1. **`chromium_binary()`** agora procura, em ordem:
+   `chromium-browser` · `chromium` · **`headless_shell`** · `google-chrome` ·
+   `chrome` · `google-chrome-stable` · e depois caminhos absolutos
+   (`$PREFIX/bin/chromium-browser`, **`$PREFIX/lib/chromium/chrome`**,
+   `$PREFIX/lib/chromium/headless_shell`, …).
+   > O launcher `$PREFIX/bin/chromium-browser` é um script; o binário de
+   > verdade está em `$PREFIX/lib/chromium/chrome`. Cobrir os dois é mais seguro.
+2. **`CHROMIUM_HINT`** — constante com o comando certo.
+3. A mensagem de boot agora diz o comando exato:
+   ```
+   ⚠️ Chromium NÃO ENCONTRADO. No Termux o pacote é 'chromium'
+      e vive no repo x11 — rode: pkg install x11-repo && pkg install chromium
+   ```
+
+**Resultado:**
+- ✅ Causa identificada: nome de pacote errado (minha culpa)
+- ✅ Detecção do binário mais robusta
+- ✅ Mensagem de erro agora dá o comando certo
+
+---
+
+## [2026-10-14 17:20] — Sessão 15: fotos 4 e 5 — post no IG funcionou, arte corrigida
+
+**Objetivo:** o usuário mandou `4.jpeg` (post no Instagram) e `5.jpg` (log do
+Termux). Pedido: *"o produto está muito pequeno na foto do IG. Preciso que
+aumente e que esse fundo seja azul mais escuro. O produto deve ficar maior
+até o fundo parecer uma borda."*
+
+### O que a foto 5 mostra — o bot está funcionando
+
+```
+✅ websocket-client OK — o /ofertas será lido via Chromium CDP.
+ℹ️ Navegador: Chromium NÃO ENCONTRADO (pkg install chromium-browser)
+✅ Telethon conectado: @linksBrazil, @xetdaspromocoes
+🤖 Ciclo do Telegram: planilha + raspagem
+📊 Planilha: 0 produto(s) válido(s).
+⊘ www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+↪️ Selenium indisponível — tentando Chromium via CDP.
+📦 Catálogo da loja: 10 produto(s)
+📦 Catálogo da loja: 19 produto(s)
+ℹ️ /ofertas não passou; usando o catálogo das lojas (29 produto(s)).
+✅ Mercado Livre: 29 produto(s).
+✅ Ciclo concluído: 2 oferta(s) da raspagem publicada(s).
+✅ Instagram publicado: 18103923329367904        ← POST NO INSTAGRAM
+```
+
+**Minha leitura: a raspagem NÃO funcionou ainda.** O Chromium não está
+instalado, então o CDP nem chegou a rodar — os 29 produtos vieram todos do
+catálogo `/social/`. Mas o bot está **saudável de ponta a ponta**: 2 ofertas
+publicadas no Telegram e 1 no Instagram.
+
+Ainda assim, três achados novos:
+
+| Achado | Detalhe |
+|---|---|
+| `tidd.ly` é outro encurtador | expandiu para `kabum.com.br/produto/694714/...` ✅ |
+| `resolve_store_link` falhou por falta de preço | `📡 Canal: Jogo De Toalhas... | preco=` → caiu no aviso de loja |
+| `git pull` divergiu no celular | precisou de `git config pull.rebase false` |
+
+---
+
+### 🔴 A causa do produto pequeno
+
+```python
+product.thumbnail((box[2]-box[0], box[3]-box[1]))   # ANTES
+```
+
+**`Image.thumbnail()` NUNCA amplia** — só reduz. A foto do ML já vem no
+tamanho original, então ela nunca crescia para preencher o quadro. Era esse o
+motivo do produto pequeno, não a margem.
+
+### Correções aplicadas
+
+1. **`_fit_contain(img, max_size)`** (novo) — escala para caber na caixa
+   **ampliando e reduzindo** (limite de 4x para não pixelar). É o "contain"
+   de verdade.
+2. **`_trim_margins(img)`** (novo) — corta a moldura branca/transparente que
+   o ML manda nas fotos de produto. Só corta se houver ganho > 2%.
+3. **`ART_BORDER = 34`** — a margem da foto caiu de 90/70 para 34px, para o
+   fundo escuro sobrar só como **borda**.
+4. **Fundo mais escuro e azul** — `gradient` foi de `(18,28,58) → (94,32,120)`
+   (que virava **roxo** no rodapé) para `(6,16,44) → (14,34,78)`, azul-marinho
+   em todo o card.
+5. Sombra um pouco mais forte (130→150, blur 22→26) para o produto destacar
+   no fundo escuro.
+
+### Medido
+
+| | Antes | Depois |
+|---|---|---|
+| Produto (foto 1000×1000 com moldura) | 900×900 | **1012×881 (+12%)** |
+| Margem do fundo | 90px | **34px** |
+| Cor do fundo | navy → **roxo** | navy → **azul escuro** |
+
+Gerado antes/depois lado a lado: o produto agora encosta quase na borda e o
+azul escuro fica só como moldura, exatamente como pedido.
+
+**Resultado:**
+- ✅ Produto maior, preenchendo o quadro
+- ✅ Fundo azul escuro, sem roxo
+- ✅ Moldura branca do ML cortada automaticamente
+- ⏳ **Falta `pkg install chromium-browser` no celular** para o `/ofertas` virar
+
+---
+
 ## [2026-10-14 16:45] — Sessão 14: foto 3 — bot MORREU por `No module named 'websocket'`
 
 **Objetivo:** o usuário mandou `E:\Pasta de erro\3.jpg` (log do Termux).

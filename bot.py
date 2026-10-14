@@ -143,6 +143,8 @@ TEMPLATE_BOX = (576, 28, 951, 183)   # borda externa do quadro
 TEMPLATE_BOX_PAD = 10                # margem de seguranca dentro do quadro
 # Card final: produto em cima, banner com o preco embaixo (opcao C).
 ART_W, ART_H = 1080, 1350
+# Margem da foto do produto: quanto MENOR, mais o fundo vira so borda.
+ART_BORDER = 34
 # Fator entre as medidas do template (1024 de largura) e o card final (1080).
 _TPL_SCALE = ART_W / TEMPLATE_W
 
@@ -823,7 +825,8 @@ def load_font(size, bold=True):
         return ImageFont.load_default()
 
 
-def gradient(size, top=(18, 28, 58), bottom=(94, 32, 120)):
+def gradient(size, top=(6, 16, 44), bottom=(14, 34, 78)):
+    """Fundo azul-marinho escuro. Sem roxo: o fundo é só moldura do produto."""
     width, height = size
     ramp = Image.new("RGBA", (1, height))
     for y in range(height):
@@ -889,6 +892,65 @@ def _draw_price_in_box(draw, box, preco, preco_original):
                   stroke_width=3, stroke_fill=(16, 48, 88, 255))
 
 
+def _fit_contain(img, max_size):
+    """Escala a imagem para CABER em max_size — AMPLIANDO se ela for menor.
+
+    Image.thumbnail() so reduz, e era por isso que a foto do produto saia
+    pequena na arte: o ML devolve a imagem no tamanho original e ela nunca
+    crescia para preencher o quadro.
+    """
+    max_w, max_h = max_size
+    if not max_w or not max_h:
+        return img
+    escala = min(max_w / img.width, max_h / img.height)
+    escala = min(escala, 4.0)                       # evita pixelar demais
+    if abs(escala - 1.0) < 0.01:
+        return img
+    return img.resize((max(1, round(img.width * escala)),
+                       max(1, round(img.height * escala))),
+                      Image.Resampling.LANCZOS)
+
+
+def _trim_margins(img, min_gain=0.02):
+    """Corta a borda branca/transparenta das fotos de marketplace.
+
+    Foto de ML costuma vir com moldura branca em volta do produto; cortar essa
+    moldura faz o produto ocupar a arte inteira.
+    """
+    try:
+        rgba = img.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        if alpha.getextrema()[0] < 250:             # tem transparencia = ja e recortada
+            return rgba
+        # varre por fora ate achar pixel que nao seja branco
+        w, h = rgba.size
+        px = rgba.load()
+
+        def branco(x, y):
+            r, g, b, a = px[x, y]
+            return a > 250 and r > 243 and g > 243 and b > 243
+
+        top = 0
+        while top < h - 1 and all(branco(x, top) for x in range(0, w, max(1, w // 60))):
+            top += 1
+        bottom = h - 1
+        while bottom > top and all(branco(x, bottom) for x in range(0, w, max(1, w // 60))):
+            bottom -= 1
+        left = 0
+        while left < w - 1 and all(branco(left, y) for y in range(0, h, max(1, h // 60))):
+            left += 1
+        right = w - 1
+        while right > left and all(branco(right, y) for y in range(0, h, max(1, h // 60))):
+            right -= 1
+        ganho_x = (right - left + 1) / w
+        ganho_y = (bottom - top + 1) / h
+        if ganho_x > min_gain and ganho_y > min_gain:
+            return rgba.crop((left, top, right + 1, bottom + 1))
+        return rgba
+    except Exception:
+        return img
+
+
 def _draw_discount_badge(draw, box, desconto_pct):
     """Selo -N% no gelo vazio a esquerda do quadro (fora do quadro do preco)."""
     badge = f"-{int(desconto_pct)}%"
@@ -919,6 +981,7 @@ def gerar_arte(image_url, preco, preco_original=None, titulo="", desconto_pct=No
                 resp = http_get(image_url, headers={"Referer": "https://www.mercadolivre.com.br/"}, timeout=20)
                 if resp is not None and resp.status_code == 200 and len(resp.content) > 1500:
                     product = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                    product = _trim_margins(product)
             except Exception:
                 product = None
 
@@ -932,16 +995,18 @@ def gerar_arte(image_url, preco, preco_original=None, titulo="", desconto_pct=No
             canvas.alpha_composite(banner, (0, banner_top))
 
         # --- Foto do produto, na area de cima ---
-        box = (90, 70, ART_W - 90, banner_top - 70 if has_template else ART_H - 150)
+        # Margem curta de propósito: o fundo escuro deve sobrar só como borda.
+        borda = ART_BORDER
+        box = (borda, borda, ART_W - borda, (banner_top - borda) if has_template else ART_H - 110)
         draw = ImageDraw.Draw(canvas)
         if product is not None:
-            product.thumbnail((box[2] - box[0], box[3] - box[1]), Image.Resampling.LANCZOS)
+            product = _fit_contain(product, (box[2] - box[0], box[3] - box[1]))
             shadow = Image.new("RGBA", product.size, (0, 0, 0, 0))
-            shadow.paste((0, 0, 0, 130), (0, 0), product)
-            shadow = shadow.filter(ImageFilter.GaussianBlur(22))
+            shadow.paste((0, 0, 0, 150), (0, 0), product)
+            shadow = shadow.filter(ImageFilter.GaussianBlur(26))
             px = box[0] + (box[2] - box[0] - product.width) // 2
             py = box[1] + (box[3] - box[1] - product.height) // 2
-            canvas.alpha_composite(shadow, (px + 8, py + 16))
+            canvas.alpha_composite(shadow, (px + 10, py + 18))
             canvas.paste(product, (px, py), product)
         else:
             # ImageDraw sobrescreve o pixel (nao faz alpha-blend): o retangulo
@@ -1158,23 +1223,31 @@ def selenium_get(url, wait=3, timeout=45):
 
 
 def chromium_binary():
-    """Acha o Chromium/Chrome. No Termux o binario e 'chromium-browser'."""
+    """Acha o Chromium/Chrome. No Termux o pacote e 'chromium' (repo x11) e o
+    binario fica como 'chromium-browser'."""
     found = env("CHROMIUM_BIN")
     if found and os.path.exists(found):
         return found
-    for name in ("chromium-browser", "chromium", "google-chrome",
-                 "chrome", "google-chrome-stable"):
+    for name in ("chromium-browser", "chromium", "headless_shell",
+                 "google-chrome", "chrome", "google-chrome-stable"):
         path = shutil.which(name)
         if path:
             return path
-    import glob as _glob
-    for pattern in ("/data/data/com.termux/files/usr/bin/chromium-browser",
+    prefix = os.getenv("PREFIX") or "/data/data/com.termux/files/usr"
+    for pattern in (f"{prefix}/bin/chromium-browser",
+                    f"{prefix}/bin/chromium",
+                    f"{prefix}/lib/chromium/chrome",
+                    f"{prefix}/lib/chromium/headless_shell",
+                    "/data/data/com.termux/files/usr/bin/chromium-browser",
                     "/system/bin/chromium-browser",
                     "C:/Program Files/Google/Chrome/Application/chrome.exe",
                     "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"):
         if os.path.exists(pattern):
             return pattern
     return None
+
+
+CHROMIUM_HINT = "pkg install x11-repo && pkg install chromium"
 
 
 def cdp_server():
@@ -2143,7 +2216,11 @@ def main():
             log("⚠️ websocket-client ausente: rode `pip install websocket-client`, "
                 "senão o /ofertas do ML não abre e o bot usa só /social/<loja>.")
         _bin = chromium_binary()
-        log(f"ℹ️ Navegador: {_bin or 'Chromium NÃO ENCONTRADO (pkg install chromium-browser)'}")
+        if _bin:
+            log(f"ℹ️ Navegador: {_bin}")
+        else:
+            log(f"⚠️ Chromium NÃO ENCONTRADO. No Termux o pacote é 'chromium' "
+                f"e vive no repo x11 — rode: {CHROMIUM_HINT}")
     if PROXIES:
         proxy_health()
     else:
