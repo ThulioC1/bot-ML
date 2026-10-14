@@ -116,6 +116,7 @@ CDP_PORT = int(env("CDP_PORT", "9222") or 9222)
 CDP_HOST = env("CDP_HOST", "127.0.0.1")
 CDP_WAIT = int(env("CDP_WAIT", "6") or 6)
 _CDP = {"proc": None, "tried_at": 0, "msg": "não iniciado"}
+NET_STATE = {"online": True, "since": 0.0}
 
 # Mercado Livre e Shopee bloqueiam por IP (PolicyAgent / 403). Sem trocar o IP de
 # saida, a raspagem direta nao funciona. Defina um proxy estavel aqui.
@@ -605,20 +606,36 @@ def affiliate_link(url, price=None, title=None):
 # Vercel Blob
 # --------------------------------------------------------------------------
 
-def upload_to_blob(file_path, remote_name):
+def upload_to_blob(file_path, remote_name, stable=True):
+    """Sobe um arquivo para o Vercel Blob.
+
+    `stable=True` manda `x-add-random-suffix: 0`, e isso e OBRIGATORIO para o
+    vitrine.json: a pagina da bio tem o endereco fixo no HTML. Sem essa flag o
+    blob cria um arquivo com sufixo aleatorio a cada upload
+    (vitrine-A1b2C3.txt) e a pagina continua lendo o old vitrine.json para
+    sempre.
+    """
     if not BLOB_TOKEN or not Path(file_path).exists():
         return None
     try:
         with open(file_path, "rb") as fh:
             payload = fh.read()
+        headers = {"Authorization": f"Bearer {BLOB_TOKEN}"}
+        if stable:
+            headers["x-add-random-suffix"] = "0"
         resp = requests.put(
             f"https://blob.vercel-storage.com/{remote_name}",
             data=payload,
-            headers={"Authorization": f"Bearer {BLOB_TOKEN}"},
+            headers=headers,
             timeout=45,
         )
         if resp.status_code == 200:
-            return resp.json().get("url")
+            data = resp.json()
+            url = data.get("url", "")
+            # o blob devolve minusculo; a pagina usa a forma com maiusculas
+            url = url.replace("rzd48c84t8k2zcdu", "rzd48c84T8k2zCDu")
+            log(f"☁️ Blob: {remote_name} atualizado")
+            return url
         log(f"⚠️ Blob: status {resp.status_code} ao enviar {remote_name}")
     except Exception as exc:
         log(f"⚠️ Blob: {exc}")
@@ -1457,12 +1474,13 @@ def _cdp_get(url, wait=None, timeout=90):
                 if value:
                     html = value
                 break
-        if not html:
-            log(f"⚠️ CDP: JS não devolveu HTML de {url[:55]}")
-            return None
+        html = value or ""
         if _is_bot_wall(html[:2500]):
             log(f"⚠️ CDP: o ML bloqueou o Chromium em {url[:55]}")
             return None
+        if len(html) < 20000:
+            log(f"⚠️ CDP: página veio Vazia ({len(html)} bytes) de {url[:55]} — "
+                f"o ML pode estar detectando o Chromium headless.")
         return _Page(html, url)
     finally:
         try:
@@ -1826,7 +1844,15 @@ def save_to_vitrine(item):
         "time": time.strftime("%d/%m/%Y %H:%M"),
     })
     save_json(VITRINE_FILE, vitrine[:40])
-    log(f"📦 Vitrine atualizada ({len(vitrine[:40])} itens).")
+    total = len(vitrine[:40])
+    log(f"📦 Vitrine atualizada ({total} itens).")
+    # Sem isto a pagina da bio (vagantepromo.vercel.app) NUNCA muda: ela le o
+    # vitrine.json do Vercel Blob e o bot so escrevia no disco do celular.
+    url = upload_to_blob(VITRINE_FILE, "vitrine.json")
+    if url:
+        log(f"🌐 Bio atualizada: {url[:78]}")
+    else:
+        log("⚠️ Vitrine não foi publicada na bio (falha no Vercel Blob).")
 
 
 # --------------------------------------------------------------------------
@@ -1917,6 +1943,7 @@ def handle_private_message(message):
         sheet_state = "OK" if fetch_sheet_products() else "sem itens"
         lines = [
             "📡 *Status das fontes*",
+            f"• Internet: {'ONLINE' if NET_STATE.get('online', True) else 'OFFLINE — ciclos pausados'}",
             f"• Planilha (Sheets): {sheet_state}",
             f"• Proxy: {PROBE_STATE['msg'] if PROXIES else 'não configurado (ML/Shopee ficam bloqueados)'}",
             f"• Navegador: {'CDP' if IS_ANDROID else ('Selenium' if USE_SELENIUM else 'desligado')}"
@@ -2247,6 +2274,31 @@ def instagram_cycle():
         log("⏭️ Post do Instagram não concluído; item mantido na fila.")
 
 
+def internet_online(timeout=10):
+    """Internet utilizavel? Testa o Telegram (que nao usa o proxy do ML).
+
+    O proxy do .env existe para o Mercado Livre; o Telegram e a API do
+    Instagram saem direto. Se o Telegram nao responde, para os nossos
+    propositos estamos sem internet.
+    """
+    if TELEGRAM_TOKEN:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
+                             timeout=timeout)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+    for url in ("https://connectivitycheck.gstatic.com/generate_204",
+                "https://www.google.com/generate_204"):
+        try:
+            if requests.get(url, timeout=timeout).status_code in (200, 204):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def main():
     log("=" * 52)
     log(">>> BOT VAGANTE PROMOÇÕES <<<")
@@ -2295,17 +2347,46 @@ def main():
 
     last_telegram = 0.0
     last_instagram = 0.0
+    last_net_check = 0.0
+    online = True
+    offline_since = 0.0
+    disparar_telegram = True          # primeiro ciclo logo apos subir
+    disparar_instagram = False
     time.sleep(5)
 
     while True:
         try:
             now = time.time()
-            if now - last_telegram >= INTERVAL_TELEGRAM:
-                telegram_cycle()
-                last_telegram = now
-            if now - last_instagram >= INTERVAL_INSTAGRAM:
-                instagram_cycle()
-                last_instagram = now
+
+            # --- Internet: quando ela volta, os ciclos rodam na hora ---
+            # Sem isso o timer avancava mesmo com o ciclo falhando, e o bot
+            # ficava ate 1 hora sem fazer nada depois que a rede voltava.
+            if now - last_net_check >= 60:
+                last_net_check = now
+                try:
+                    agora_online = internet_online()
+                except Exception:
+                    agora_online = online
+                NET_STATE["online"] = agora_online
+                if not agora_online and online:
+                    offline_since = now
+                    log("📴 Sem internet — ciclos pausados. Vou retomar assim que voltar.")
+                elif agora_online and not online:
+                    log(f"📶 Internet voltou depois de {int((now - offline_since) / 60)} min. "
+                        f"Rodando o ciclo agora mesmo.")
+                    disparar_telegram = True       # compensa o tempo perdido
+                    disparar_instagram = True
+                online = agora_online
+
+            if online:
+                if disparar_telegram or now - last_telegram >= INTERVAL_TELEGRAM:
+                    telegram_cycle()
+                    last_telegram = now
+                    disparar_telegram = False
+                if disparar_instagram or now - last_instagram >= INTERVAL_INSTAGRAM:
+                    instagram_cycle()
+                    last_instagram = now
+                    disparar_instagram = False
         except Exception as exc:
             log(f"⚠️ Erro no ciclo principal: {exc}")
         time.sleep(15)

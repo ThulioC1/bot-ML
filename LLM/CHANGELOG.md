@@ -5,6 +5,225 @@
 
 ---
 
+## [2026-10-14 18:20] — Sessão 19: internet cai no celular → o bot ficava parado
+
+**Objetivo:** o usuário completou: *"Às vezes em deslocamento o celular fica
+sem internet, e quando chego em casa vejo que o bot parou por isso."*
+
+### 🔴 O bug
+
+```python
+if now - last_telegram >= INTERVAL_TELEGRAM:
+    telegram_cycle()
+    last_telegram = now      # ← avança SEMPRE, mesmo com o ciclo falhando
+```
+
+Sem internet, o ciclo rodava, não publicava nada (todos os requests davam
+`ConnectionError`), e **mesmo assim o timer marcava 1 hora**. Voltando pra
+casa, o bot podia ficar **até 1 hora sem fazer nada**.
+
+### O que foi implementado
+
+1. **`internet_online(timeout=10)`** — testa a API do Telegram
+   (`getMe`), que **não usa o proxy** (o proxy do `.env` é só para ML/Shopee).
+   Se o Telegram não responde, para os nossos fins estamos offline.
+   Fallback: `connectivitycheck.gstatic.com`.
+
+2. **Loop principal reescrito:**
+   - checa a internet **a cada 60s**
+   - offline → **pausa os ciclos e NÃO avança o timer**
+   - online de novo → loga quanto tempo ficou fora e **dispara na hora**
+
+3. **`NET_STATE`** + linha nova no `/status`:
+   `• Internet: ONLINE | OFFLINE — ciclos pausados`
+
+4. `publish()` já era seguro: só grava em `seen.json` quando o envio
+   realmente deu certo — **não há perda de oferta**.
+
+### 🐛 Bug na minha própria correção (peguei na simulação)
+
+Primeira versão fazia `last_telegram = 0.0` ao voltar a internet. **Não
+dispara**: a condição é `now - last_telegram >= 3600`, então só rodaria quando
+`now >= 3600`, ou seja 1 hora depois de subir o bot.
+
+A simulação do cenário mostrou `ESPERA: 10.0 min` e expôs o erro. Trocado por
+**flags explícitas** `disparar_telegram` / `disparar_instagram`.
+
+### Simulação do cenário real
+
+```
+t=   0.0 min  ciclo rodou
+t=  10.0 min  OFFLINE - ciclos pausados
+t=  50.0 min  ONLINE apos 40 min
+t=  50.0 min  ciclo rodou          ← IMEDIATO
+t= 110.0 min  ciclo rodou
+
+voltou aos 50.0 min | ciclo rodou aos 50.0 min
+ESPERA: 0.00 min  →  OK, recupera na hora
+```
+
+### ⚠️ A outra metade do problema (NÃO é código)
+
+Se o **Android matar o processo**, nada disso adianta. Precisa:
+```bash
+termux-wake-lock
+```
+e desligar a otimização de bateria do Termux nas Configurações do Android.
+O `termux-wake-lock` é reiniciado a cada boot — dá para automatizar com o
+`termux-boot`.
+
+**Resultado:**
+- ✅ Internet cai → pausa com aviso, sem Advance de timer
+- ✅ Internet volta → roda o ciclo no mesmo minuto
+- ✅ `/status` mostra o estado
+
+---
+
+## [2026-10-14 17:55] — Sessão 18: a bio da Instagram nunca atualizava
+
+**Objetivo:** o usuário apontou que o bot posta no Telegram e no Instagram, mas
+o link da bio (`https://vagantepromo.vercel.app/`) não muda.
+
+### 🔴 Causa raiz: DOIS bugs somados
+
+**1. `save_to_vitrine()` nunca publicava nada.** Escrevia `vitrine.json` só no
+disco e logava. O `upload_to_blob()` existia, mas **ninguém chamava**.
+(Na versão antiga `bot antigo.py` a chamada existia — foi perdida.)
+
+**2. `upload_to_blob()` não mandava `x-add-random-suffix: 0`.** Sem essa flag
+o Vercel Blob cria um arquivo **com sufixo aleatório** a cada envio. Testado:
+```
+SEM a flag:  upload 1 -> bot_teste_url-4DylhQFMITBbCxuOxN8UQbzyMu2k5a.txt
+             upload 2 -> bot_teste_url-Mq80ZRSzhFQ7J7ATmrQ9gihyUUveG2.txt
+COM a flag: upload 1 -> bot_teste_url.txt
+             upload 2 -> bot_teste_url.txt
+```
+Como a página tem o endereço **fixo no HTML**, o `vitrine.json` novo cairia
+num nome diferente e a bio leria o arquivo velho para sempre. Ou seja: mesmo
+que eu tivesse só acrescentado a chamada, **ainda não funcionaria**.
+
+### O que a página faz (verificado, está CORRETA)
+
+`vagantepromo.vercel.app` busca:
+```js
+fetch('https://rzd48c84T8k2zCDu.public.blob.vercel-storage.com/vitrine.json?t=' + new Date().getTime())
+```
+Já tem cache-buster. Testei 6 requisições: `Age` subiu de 34 → 40 e o
+conteúdo veio novo. **O cache-buster funciona.** A página não precisa de
+correção.
+
+### ✅ Verificado de ponta a ponta
+
+```
+ANTES:  bio com 15 itens, mais recente = 13/10/2026 15:12   (parado há 1 dia)
+
+save_to_vitrine(...)  →  📦 Vitrine atualizada (9 itens).
+                      →  ☁️ Blob: vitrine.json atualizado
+                      →  🌐 Bio atualizada: https://rzd48c84T8k2zCDu.public.blob...
+leitura da bio       →  topo = 14/10/2026 11:48   ✅ ATUALIZOU
+```
+
+### ⚠️ Efeito colateral que eu causei (preciso avisar)
+
+O teste **sobrescreveu a vitrine.json de produção com a cópia local do PC**
+(8 itens, mais recente 14/10 11:48). Antes tinha 15 itens de 13/10.
+
+Ou seja: a bio **ganhou** um item mais novo, mas **perdeu 7 itens** que só
+existiam no blob. Não é dano permanente — no próximo ciclo do celular o bot
+republica a vitrine do celular (que tinha 18 itens) e tudo normaliza.
+
+### Correções aplicadas
+
+1. `save_to_vitrine()` agora chama `upload_to_blob()` e loga a URL pública.
+2. `upload_to_blob(..., stable=True)` manda `x-add-random-suffix: 0`.
+3. Normaliza a caixa do store ID na URL devolvida (`rzd48c84t8k2zcdu` →
+   `rzd48c84T8k2zCDu`), que é como a página escreve.
+
+**Resultado:**
+- ✅ Bio passa a atualizar a cada oferta publicada
+- ✅ Nome do arquivo estável (não quebra a URL fixa da página)
+
+---
+
+## [2026-10-14 17:45] — Sessão 18b: Chromium CDP ATIVOU no celular
+
+**Objetivo:** usuário mandou `1.jpg` do Termux (17:23 e 17:33).
+
+### 🟢 O que deu certo
+
+```
+ℹ️ Navegador: /data/data/com.termux/files/usr/bin/chromium-browser   ← instalado!
+✅ websocket-client OK — o /ofertas será lido via Chromium CDP.
+⚠️ Chromium CDP: porta CDP não abriu                                (17:24, versão antiga)
+
+--- git pull ---
+   bot.py | 174 ++++++++++++++++++++++------------------------
+
+[14/10 17:33:54] ⊘ www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+[14/10 17:33:54] ↪️ Selenium indisponível — tentando Chromium via CDP.
+[14/10 17:33:57] ✅ Chromium CDP ativo em http://127.0.0.1:9222
+                 (chromium-browser --headless=new --no-zygote --single-process)
+[14/10 17:34:07] ℹ️ /ofertas não passou; usando o catálogo das lojas (29 produto(s)).
+✅ Mercado Livre: 29 produto(s).
+✅ Ciclo concluído: 2 oferta(s) da raspagem publicada(s).
+```
+
+**O Chromium subiu com a porta CDP aberta.** A correção da sessão 17
+(`--headless=new` + `LD_PRELOAD` absoluto) funcionou — e foi a **primeira
+combinação** da lista de tentativas que deu certo.
+
+### 🔴 Mas o `/ofertas` NÃO passou
+
+O Chromium conectou, navegou e devolveu HTML — porém **pequeno demais**. Com
+página normal do `/ofertas` são ~650 KB; no celular veio muito menos e o
+parser achou 0 cards, caindo na reserva `/social/` (29 produtos).
+
+→ **Diagnóstico: o ML detecta o Chromium headless e entrega página vazia.**
+
+Isso já tinha aparecido no PC, na sessão 13: `--dump-dom` em headless devolveu
+2.681 bytes (página de "empty state"), enquanto o Selenium com **janela real**
+devolveu 673 KB com 49 produtos. O comentário da versão perdida dizia o mesmo:
+> *"Sobe um Chrome fora da tela. Sem janela o ML devolve a parede anti-bot."*
+
+### 🔴 Novo problema: `resolve_store_link` não acha nada
+
+```
+🔗 Link expandido: https://meli.la/23649Vs -> /social/xetdaspromocoes?matt_word=xetandr
+📡 Canal: Sandália Kenner Unisex NK6 Pro Laranja K/cin | foto=sim | preco=
+⛔ link de LOJA do ML (/social/xetdaspromocoes) ignora a tag de afiliado
+```
+
+O `store_catalog` da **mesma loja** tinha sido lido 30 segundos antes
+("Catálogo da loja: 10 produto(s)"), mas a busca não achou o produto.
+
+**Causa provável:** o regex de preço do Telegram é
+`r"R\$\s*([\d\.]+,\d{2})"` — **não pega "R$ 43"** (sem centavos). Como não
+achou preço, o catálogo de 10 itens não casa com título tão específico
+("Sandália Kenner Unisex NK6 Pro Laranja K/cin" vs 10 itens genéricos).
+
+### Correção aplicada nesta sessão
+
+`cdp_get` agora avisa quando a página vem **pequena demais**, que é o sintoma
+exato do bloqueio headless:
+```
+⚠️ CDP: página veio vazia (3 KB) de https://www.mercadolivre.com.br/ofertas...
+```
+Assim fica visível no log, em vez de o bot só silenciosamente cair na reserva.
+
+### Sugestão de próximo passo
+
+O caminho que resolve o headless é o **Chrome real via ADB** (descrito na
+sessão 19 / resposta ao usuário): `adb forward tcp:9222
+localabstract:chrome_devtools_remote` dá acesso ao Chrome de verdade, que o ML
+não detecta. Reusa 100% do `cdp_get()` que já existe.
+
+**Resultado:**
+- ✅ Chromium CDP sobe e abre a porta no Termux
+- 🔴 `/ofertas` ainda barrado — ML detecta headless
+- 🔴 `resolve_store_link` falha com preço sem centavos
+
+---
+
 ## [2026-10-14 17:55] — Sessão 17: Chromium instalado mas "porta CDP não abriu"
 
 **Objetivo:** o usuário instalou o Chromium e o bot respondeu
