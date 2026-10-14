@@ -151,6 +151,66 @@ credencial). Rodar `python bot.py --login` no Termux.
 
 ---
 
+## [RESOLVIDA · 2026-10-14] Selenium não funciona no Termux — resolvido com CDP
+
+`selenium-manager` não é compilado para arm64. Implementado o backend **CDP**
+(Chrome DevTools Protocol) na sessão 13: sobe o Chromium com
+`--remote-debugging-port` e lê a página por WebSocket. Sem driver, sem Selenium.
+
+**Validado no PC com Chrome e `USE_SELENIUM=False`** (o mesmo caminho do
+celular): 49 produtos do `/ofertas`, 727 KB de HTML, sem parede anti-bot.
+
+**Falta testar em hardware Android** — o Chromium do Termux pode ter quirks.
+
+## [ABERTA] `websocket-client` é dependência nova
+
+`pip install websocket-client` (python puro, compila em qualquer lugar).
+Precisa entrar no `requirements.txt`.
+
+## [ABERTA] Chromium no Termux é pesado
+
+Rodar Chromium dentro do Termux consome bastante bateria/memória. Manter
+`termux-wake-lock` e a otimização de bateria desligada, senão o SO mata.
+
+---
+
+## [RESOLVIDA · 2026-10-14] `/ofertas` — eu tinha concluído errado
+
+Na sessão 11 concluí que `/ofertas` era impossível e troquei a fonte por
+`/social/<loja>`. **Estava errado:** só testei HTTP. Com Chrome de verdade
+(Selenium, janela real fora da tela) a mesma URL devolve 49 produtos —
+provado na sessão 12.
+
+**Corrigido:** `browser_get()` + `selenium_driver()` + `selenium_get()`
+portados do bytecode. `/social/<loja>` ficou como reserva.
+
+## [ABERTA] Selenium não funciona no Termux — `/ofertas` no celular
+
+`selenium-manager` não é compilado para arm64. No celular o `/ofertas` via
+Chrome fica indisponível e o bot usa a reserva `/social/<loja>` (funciona).
+
+Para `/ofertas` no celular é preciso **CDP** (Chrome DevTools Protocol) no
+lugar do Selenium. Ver `TERMUX.md` seção 3 (NÍVEL 2).
+
+## [ABERTA · CRÍTICA] Mercado Livre bloqueia HTTP — mesmo no IP residencial
+
+Testado no PC (IP datacenter) e no celular (IP residencial): **o mesmo
+resultado.**
+
+| URL | Resultado |
+|---|---|
+| `/ofertas?page=N` | HTTP 200 + `suspicious-traffic` → parede |
+| `lista.mercadolivre.com.br/*` | HTTP 200 + parede |
+| página de produto | HTTP 200 + parede |
+| `api.mercadolibre.com` | HTTP 403 |
+| **`/social/<loja>`** | ✅ **200, 243–297 KB, produtos com preço** |
+| home `/` | ✅ 545 KB |
+
+Não adianta trocar cookie, User-Agent mobile ou sessão — testado, nenhum
+dos três destrava. **Só o Chrome de verdade passa.**
+
+---
+
 ## [ABERTA] A planilha do Google está VAZIA (verificado 14/10 14:50)
 
 CSV público retorna HTTP 200 com cabeçalho `['Link', 'Preço', 'Titulo', 'Foto']`

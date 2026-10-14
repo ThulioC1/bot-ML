@@ -5,6 +5,180 @@
 
 ---
 
+## [2026-10-14 16:10] — Sessão 13: CDP no Termux — `/ofertas` funciona no celular (SEM Selenium)
+
+**Objetivo:** o usuário escolheu a opção 3 — "a prioridade é rodar no celular".
+Precisava de um backend de navegador que funcione no Termux, já que o Selenium
+não existe para arm64.
+
+### Por que CDP e não Selenium
+
+Selenium no Termux é inviável: o `selenium-manager` não é compilado para arm64
+e o ChromeDriver oficial não existe para Android. Mas o Chromium do Termux
+fala **Chrome DevTools Protocol** direto por WebSocket — sem driver, sem
+Selenium, sem Java.
+
+### Implementado no `bot.py`
+
+| Função | O que faz |
+|---|---|
+| `chromium_binary()` | acha `chromium-browser` (Termux), `chromium`, `chrome`… ou `CHROMIUM_BIN` |
+| `cdp_server()` | sobe o Chromium com `--remote-debugging-port=9222` e espera a porta abrir |
+| `cdp_get(url, wait, timeout)` | abre aba → espera `Page.loadEventFired` → `Runtime.evaluate` de `document.outerHTML` |
+| `cdp_close()` | encerra o Chromium |
+| `browser_get()` | agora é a escada: **requests → Selenium → CDP** |
+
+Config nova: `CDP_PORT` (9222), `CDP_HOST` (127.0.0.1), `CDP_WAIT` (6),
+`CHROMIUM_BIN`.
+
+**Argumentos usados no Termux** (detectados por `sys.platform == "android"`):
+```
+--single-process --no-zygote
+LD_PRELOAD=libtermux-exec.so
+--remote-allow-origins=* --no-sandbox --disable-dev-shm-usage
+--disable-blink-features=AutomationControlled --lang=pt-BR
+```
+> `--single-process` é obrigatório: o `LD_PRELOAD` do Termux quebra o zygote
+> do Android, então o Chromium precisa rodar sem forks.
+
+### Dois bugs meus no caminho
+
+1. **Loop de leitura do WebSocket**: eu fazia `break` no primeiro timeout do
+   `recv`. A resposta do `Runtime.evaluate` chega depois (mls 30) — então
+   eu saía antes. Agora `continue` até o deadline.
+2. **Aba aberta 2x**: eu criava a aba já com a URL e ainda mandava
+   `Page.navigate`, gerando navegações duplicadas (msgs 12 e 18). Agora a aba
+   abre em `about:blank` e só depois navega.
+
+### ✅ PROVADO, com Selenium desligado (o mesmo caminho do celular)
+
+```
+3) cdp_get() em /ofertas   (USE_SELENIUM = False)
+   ✅ HTML 727.898 bytes | cards: 49 | MLB-ids: 119 | parede anti-bot: False
+      Kit 10 Cuecas Boxer Sem Costura Polo Wear So       149
+      Ar Condicionado Inverter Philco 9000 Btus Fr   1.749
+      Smartphone Motorola Moto G17 4g - 256gb 4gb        966
+      Creatina Growth Supplements Monohidratada em        64
+
+4) fetch_mercado_livre_products() completo
+   🚫 www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+   ↪️ Selenium indisponível — tentando Chromium via CDP.
+   📦 Catálogo da loja: 19 produto(s)
+   ✅ Mercado Livre: 48 produto(s).
+      R$   165,78  Mala de Bordo Rígida Sweet Studio...        [raspagem]
+      R$    96,00  Mochila Tática Imperpeável Militar...        [raspagem]
+      R$   418,00  Microsoft 365 Family 1 Ano + Kaspersky      [raspagem]
+```
+
+**48 produtos — sendo 29 do `/ofertas` via CDP e 19 do catálogo `/social/`.**
+
+### O que o usuário precisa fazer no Termux
+
+```bash
+pkg install chromium-browser
+pip install websocket-client        # python puro, instala sem compilar
+```
+
+E ter `termux-wake-lock` ativo, porque o Chromium é pesado.
+
+**Resultado:**
+- ✅ `/ofertas` funciona no celular, sem Selenium
+- ✅ Escada de 3 níveis: requests → Selenium (PC) → CDP (Android)
+- ✅ `/social/<loja>` continua como reserva
+- ⏳ **Não testado em hardware Android** — validado no PC com Chrome, forçando o
+  caminho CDP. O Chromium do Termux pode ter quirks.
+
+---
+
+## [2026-10-14 15:45] — Sessão 12: `/ofertas` volta a funcionar com Chrome real (Selenium)
+
+**Objetivo:** o usuárioukes Year質問ou: *"Não tem como o bot fazer scrap
+nessa pagina não? Eu tinha uma versão dele que sorteava uma das paginas
+dessa sessão do mercado livre e trazia os produtos normalmente."*
+
+### 🔴 EU ESTAVA ERRADO na sessão 11
+
+Na sessão 11 eu concluí que `/ofertas` era "impossível" e substituí a fonte
+por `/social/<loja>`. **Isso estava errado.** Eu tinha testado **só HTTP**
+(`requests` e `curl_cffi`) e concluí que o ML bloqueia tudo.
+
+O usuário tinha razão: a versão anterior dele funcionava. Investigando o
+bytecode da versão perdida, achei a diferença — e ela é **uma função**:
+
+```
+L1223 fetch_mercado_livre_products → usava browser_get(), NÃO http_get()
+L276  browser_get(url, wait)  "HTML de uma pagina, com o plano B ja
+                              aplicado (requests -> Chrome)"
+```
+
+`browser_get` tenta HTTP; se vier `account-verification` ou
+`suspicious-traffic`, **sobe um Chrome de verdade**. Era isso.
+
+### Por que o Chrome passa e o HTTP não
+
+O `selenium_driver` da versão perdida tem o comentário exato:
+> *"Sobe um Chrome fora da tela. Sem janela o ML devolve a parede anti-bot."*
+
+Argumentos porteados:
+`--window-position=-32000,-32000` (janela **real**, fora da tela — headless
+também é barrado), `--disable-blink-features=AutomationControlled`,
+`excludeSwitches: [enable-automation, useAutomationExtension]`,
+`--lang=pt-BR`, `--window-size=1400,1000`.
+
+### ✅ PROVADO nesta máquina
+
+```
+1) http_get em /ofertas
+   🚫 www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+   parede anti-bot: True
+
+2) browser_get em /ofertas  (mesma URL)
+   ✅ Chrome (Selenium) iniciado — o Mercado Livre volta a responder.
+   -> HTML de 673.099 bytes | cards: 49 | parede anti-bot: False
+      Tênis Fila Corrida Caminhada Heating Treino        333
+      Combo Teclado e Mouse sem fio Logitech MK235       169
+      Furadeira Parafusadeira A Bateria 12V 3/8" 1       209
+
+3) fallback /social/<loja>
+   📦 Catálogo da loja: 19 produto(s)
+   📦 Catálogo da loja: 10 produto(s)
+   ✅ Mercado Livre: 48 produto(s).
+```
+
+**Mesma URL, mesmo momento: HTTP devolve a parede; Chrome devolve 49 produtos.**
+
+### O que foi implementado no `bot.py`
+
+| Item | Detalhe |
+|---|---|
+| `selenium_driver()` | Chrome de janela real fora da tela, singleton com lock |
+| `selenium_get(url, wait, timeout)` | baixa a página; se o ML barrar até o Chrome, devolve `None` |
+| `class _Page` | shim com `.text`/`.url`/`.status_code` para a mesma interface do `requests.Response` |
+| `browser_get(url, wait)` | HTTP → se parede anti-bot → Chrome |
+| `fetch_mercado_livre_products()` | voltou a usar `/ofertas?page=N` via `browser_get`; mantém `/social/<loja>` como **reserva** |
+| Config | `USE_SELENIUM` (default `1`), `SELENIUM_HEADLESS` (default `0` = janela real) |
+
+Ainda da sessão 11, que continuam válidos:
+- `remember_store(url)` — aprende lojas `/social/<user>` dos links de canal
+- `known_stores()` — lojas do `.env` (`ML_STORES`) + as aprendidas
+- `lojas.json` — persistência
+
+### Nota importante sobre o celular
+
+**Selenium não funciona no Termux** (o `selenium-manager` não é compilado
+para arm64). Então no celular o `/ofertas` via Chrome fica indisponível e o
+bot cai na reserva `/social/<loja>` — que funciona (48 produtos no teste).
+
+Para `/ofertas` no celular seria preciso **CDP** (Chrome DevTools Protocol)
+em vez de Selenium. Ver `TERMUX.md`.
+
+**Resultado:**
+- ✅ Corrigido um erro meu: `/ofertas` **é** raspável, com Chrome de verdade
+- ✅ Provado com 49 produtos na mesma URL que o HTTP bloqueia
+- ✅ `/social/<loja>` mantido como reserva (funciona em qualquer lugar)
+
+---
+
 ## [2026-10-14 15:10] — Sessão 11: `resolve_store_link` implementado (link de loja vira link de produto)
 
 **Objetivo:** o usuário aprovou ("se isso for resolver, sim") implementar a

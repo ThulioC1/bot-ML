@@ -15,6 +15,8 @@ import json
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -84,6 +86,30 @@ SHEET_CSV_URL = env(
 SOURCE_CHANNELS = [c.strip() for c in env("SOURCE_CHANNELS").split(",") if c.strip()]
 SEARCH_TERMS = [t.strip() for t in env("SEARCH_TERMS").split(",") if t.strip()]
 
+# Lojas do ML usadas como fonte de ofertas. /ofertas e /lista/ estao atras do
+# bot-wall do ML e NUNCA respondem (nem com sessao, cookie ou UA mobile).
+# Ja /social/<loja> responde sempre e traz os produtos com preco e titulo.
+# Deixe vazio no .env para o bot usar so as lojas que ele aprendeu nos canais.
+ML_STORES = [s.strip().strip("/") for s in env("ML_STORES").split(",") if s.strip()]
+ML_STORE_BASE = "https://www.mercadolivre.com.br/social/"
+
+# O ML devolve "suspicious-traffic" para requests E para curl_cffi. So um Chrome
+# de verdade que passa -- por isso o Selenium. Sem janela (headless) o ML tambem
+# barra, entao o padrao e janela real escondida fora da tela.
+USE_SELENIUM = env("USE_SELENIUM", "1").strip().lower() not in ("0", "false", "nao", "não")
+SELENIUM_HEADLESS = env("SELENIUM_HEADLESS", "0").strip().lower() in ("1", "true", "sim")
+_DRIVER = None
+_DRIVER_LOCK = threading.Lock()
+SELENIUM_STATE = {"ok": False, "msg": "não iniciado"}
+
+# --- Backend CDP (Chrome DevTools Protocol) ---------------------------
+# No Termux o Selenium nao funciona (selenium-manager nao existe para arm64),
+# mas o Chromium do Termux conversa CDP direto. Serve tambem no PC.
+CDP_PORT = int(env("CDP_PORT", "9222") or 9222)
+CDP_HOST = env("CDP_HOST", "127.0.0.1")
+CDP_WAIT = int(env("CDP_WAIT", "6") or 6)
+_CDP = {"proc": None, "tried_at": 0, "msg": "não iniciado"}
+
 # Mercado Livre e Shopee bloqueiam por IP (PolicyAgent / 403). Sem trocar o IP de
 # saida, a raspagem direta nao funciona. Defina um proxy estavel aqui.
 # Formatos aceitos:  http://usuario:senha@host:porta   |   http://host:porta
@@ -100,6 +126,7 @@ SEEN_FILE = BASE_DIR / "seen.json"
 IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
 VITRINE_FILE = BASE_DIR / "vitrine.json"
 OFFSET_FILE = BASE_DIR / "telegram_offset.json"
+STORES_FILE = BASE_DIR / "lojas.json"
 TEMPLATE_FILE = BASE_DIR / "img" / "template.png"
 
 # Geometria do template, medida em img/template.png (1024x217).
@@ -1052,19 +1079,318 @@ def fetch_sheet_products():
     return products
 
 
-def fetch_mercado_livre_products(search_query=None):
-    products = []
-    if search_query:
-        urls = [f"https://lista.mercadolivre.com.br/{urllib.parse.quote(search_query)}"]
-    else:
-        page = random.randint(1, 20)
-        urls = [f"https://www.mercadolivre.com.br/ofertas?page={page}"]
+def selenium_driver():
+    """Sobe um Chrome FORA DA TELA. Sem janela o ML devolve a parede anti-bot."""
+    global _DRIVER
+    if not USE_SELENIUM:
+        return None
+    with _DRIVER_LOCK:
+        if _DRIVER is not None:
+            return _DRIVER
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+        except Exception:
+            SELENIUM_STATE["msg"] = "selenium nao instalado (pip install selenium)"
+            log(f"⚠️ Selenium: {SELENIUM_STATE['msg']}. Seguindo so com requests.")
+            return None
+        try:
+            opts = Options()
+            if SELENIUM_HEADLESS:
+                opts.add_argument("--headless=new")
+            opts.add_argument("--lang=pt-BR")
+            opts.add_argument("--window-size=1400,1000")
+            opts.add_argument("--window-position=-32000,-32000")  # real, so fora da vista
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--no-default-browser-check")
+            opts.add_experimental_option("excludeSwitches", ["enable-automation",
+                                                             "useAutomationExtension"])
+            opts.add_experimental_option("useAutomationExtension", False)
+            _DRIVER = webdriver.Chrome(options=opts)
+            _DRIVER.set_page_load_timeout(45)
+            SELENIUM_STATE["ok"] = True
+            SELENIUM_STATE["msg"] = "Chrome ativo"
+            log("✅ Chrome (Selenium) iniciado — o Mercado Livre volta a responder.")
+            return _DRIVER
+        except Exception as exc:
+            SELENIUM_STATE["ok"] = False
+            SELENIUM_STATE["msg"] = f"falhou ({type(exc).__name__})"
+            log(f"⚠️ Selenium: {SELENIUM_STATE['msg']}. Seguindo so com requests.")
+            return None
 
-    for url in urls:
-        resp = http_get(url, timeout=25)
-        if resp is None or resp.status_code != 200:
+
+class _Page:
+    """Shim para o selenium_get devolver a mesma interface do requests.Response."""
+
+    def __init__(self, text, url):
+        self.text = text or ""
+        self.url = url
+        self.status_code = 200 if text else 0
+        self.headers = {"Content-Type": "text/html"}
+
+
+def selenium_get(url, wait=3, timeout=45):
+    """Baixa a pagina pelo Chrome de verdade. Devolve o HTML ou None."""
+    driver = selenium_driver()
+    if driver is None:
+        return None
+    with _DRIVER_LOCK:
+        try:
+            driver.get(url)
+            if wait:
+                time.sleep(wait)
+            html = driver.page_source
+            if _is_bot_wall(html[:2500]):
+                log("⚠️ Selenium não conseguiu abrir " + url[:60] + " (ML bloqueou o Chrome).")
+                return None
+            return _Page(html, driver.current_url)
+        except Exception as exc:
+            log(f"⚠️ Selenium: {type(exc).__name__}: {exc}")
+            return None
+
+
+def chromium_binary():
+    """Acha o Chromium/Chrome. No Termux o binario e 'chromium-browser'."""
+    found = env("CHROMIUM_BIN")
+    if found and os.path.exists(found):
+        return found
+    for name in ("chromium-browser", "chromium", "google-chrome",
+                 "chrome", "google-chrome-stable"):
+        path = shutil.which(name)
+        if path:
+            return path
+    import glob as _glob
+    for pattern in ("/data/data/com.termux/files/usr/bin/chromium-browser",
+                    "/system/bin/chromium-browser",
+                    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+                    "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"):
+        if os.path.exists(pattern):
+            return pattern
+    return None
+
+
+def cdp_server():
+    """Sobe o Chromium escutando CDP na porta e devolve a URL base (ou None)."""
+    base = f"http://{CDP_HOST}:{CDP_PORT}"
+    try:
+        if requests.get(f"{base}/json/version", timeout=3).status_code == 200:
+            return base
+    except Exception:
+        pass
+
+    if _CDP["proc"] is not None and time.time() - _CDP["tried_at"] < 60:
+        return None                      # ja tentou e falhou, nao fica tentando
+    _CDP["tried_at"] = time.time()
+
+    binary = chromium_binary()
+    if not binary:
+        _CDP["msg"] = "Chromium não encontrado"
+        return None
+
+    profile = BASE_DIR / ".chrome-cdp"
+    profile.mkdir(exist_ok=True)
+    args = [
+        binary,
+        "--remote-debugging-port=%d" % CDP_PORT,
+        "--remote-allow-origins=*",
+        "--user-data-dir=%s" % profile,
+        "--no-first-run", "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+        "--lang=pt-BR", "--window-size=1400,1000",
+        "about:blank",
+    ]
+    # No Termux o Chromium e ET_DYN: precisa de LD_PRELOAD para rodar, e
+    # --single-process porque o LD_PRELOAD quebra o zygote do Android.
+    if sys.platform == "android" or os.getenv("TERMUX_VERSION"):
+        envp = dict(os.environ)
+        envp["LD_PRELOAD"] = "libtermux-exec.so"
+        args.insert(1, "--single-process")
+        args.insert(1, "--no-zygote")
+    else:
+        envp = None
+
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=envp)
+        _CDP["proc"] = proc
+    except Exception as exc:
+        _CDP["msg"] = f"não subiu ({type(exc).__name__})"
+        return None
+
+    for _ in range(40):                    # espera a porta abrir
+        time.sleep(0.5)
+        try:
+            if requests.get(f"{base}/json/version", timeout=2).status_code == 200:
+                _CDP["msg"] = "Chromium CDP ativo"
+                log(f"✅ Chromium CDP ativo em {base} ({os.path.basename(binary)})")
+                return base
+        except Exception:
             continue
-        soup = BeautifulSoup(resp.text, "html.parser")
+    _CDP["msg"] = "porta CDP não abriu"
+    log(f"⚠️ Chromium CDP: {_CDP['msg']}")
+    return None
+
+
+def cdp_get(url, wait=None, timeout=90):
+    """Baixa a pagina por CDP e devolve o HTML renderizado, ou None.
+
+    Passos: abre uma aba -> espera o JS rodar -> le document.outerHTML.
+    """
+    import websocket  # websocket-client (python puro, instala no Termux)
+
+    base = cdp_server()
+    if not base:
+        return None
+    wait = CDP_WAIT if wait is None else wait
+
+    target = None
+    try:
+        resp = requests.put(f"{base}/json/new?about:blank", timeout=10)
+        if resp.status_code not in (200, 201):
+            resp = requests.get(f"{base}/json/new?about:blank", timeout=10)
+        target = resp.json()
+    except Exception as exc:
+        log(f"⚠️ CDP: não consegui abrir aba ({type(exc).__name__})")
+        return None
+    if not isinstance(target, dict) or not target.get("webSocketDebuggerUrl"):
+        log("⚠️ CDP: resposta inesperada ao abrir aba.")
+        return None
+
+    ws_url = target["webSocketDebuggerUrl"]
+    try:
+        ws = websocket.create_connection(ws_url, timeout=timeout,
+                                         origin=f"http://{CDP_HOST}:{CDP_PORT}")
+    except Exception as exc:
+        log(f"⚠️ CDP: WebSocket falhou ({type(exc).__name__}). "
+            f"Verifique se o Chromium subiu com --remote-allow-origins=*")
+        return None
+
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Page.enable"}))
+        ws.send(json.dumps({"id": 2, "method": "Page.navigate",
+                            "params": {"url": url}}))
+
+        # Espera o load: o evaluate so faz sentido depois que a pagina montou.
+        loaded = False
+        deadline = time.time() + timeout
+        while time.time() < deadline and not loaded:
+            try:
+                ws.settimeout(5)
+                msg = json.loads(ws.recv())
+            except Exception:
+                continue                      # timeout aqui e normal: o JS roda
+            if msg.get("method") == "Page.loadEventFired":
+                loaded = True
+        time.sleep(max(wait, 0))               # deixa o JS de listagem montar
+
+        ws.send(json.dumps({
+            "id": 3, "method": "Runtime.evaluate",
+            "params": {"expression": "document.documentElement.outerHTML",
+                       "returnByValue": True},
+        }))
+        html, deadline = None, time.time() + 45
+        while time.time() < deadline:
+            try:
+                ws.settimeout(10)
+                raw = ws.recv()
+            except Exception:
+                continue                      # segue tentando ate o deadline
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if msg.get("id") == 3:
+                value = ((msg.get("result") or {}).get("result") or {}).get("value")
+                if value:
+                    html = value
+                break
+        if not html:
+            log(f"⚠️ CDP: JS não devolveu HTML de {url[:55]}")
+            return None
+        if _is_bot_wall(html[:2500]):
+            log(f"⚠️ CDP: o ML bloqueou o Chromium em {url[:55]}")
+            return None
+        return _Page(html, url)
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def cdp_close():
+    proc = _CDP.get("proc")
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        _CDP["proc"] = None
+
+
+def browser_get(url, wait=3):
+    """HTML de uma pagina, com o plano B ja aplicado.
+
+    requests/curl_cffi -> Chrome de verdade. No PC usa Selenium; no Android
+    (onde o Selenium nao existe para arm64) usa CDP direto no Chromium.
+    """
+    resp = http_get(url)
+    head = resp.text[:2000] if resp is not None else ""
+    if resp is None or "account-verification" in head or "suspicious-traffic" in head:
+        page = selenium_get(url, wait)
+        if page is not None:
+            return page
+        log("↪️ Selenium indisponível — tentando Chromium via CDP.")
+        return cdp_get(url, wait=(wait + 3 if wait else CDP_WAIT))
+    return resp
+
+
+def remember_store(url):
+    """Guarda a loja (/social/<user>) vista num link de canal para usar como fonte."""
+    match = re.search(r"mercadolivre\.com\.br/social/([^/?#]+)", url or "", re.I)
+    if not match:
+        return
+    store = match.group(1).strip("/").lower()
+    if not store:
+        return
+    known = load_json(STORES_FILE, [])
+    if store in known:
+        return
+    known.append(store)
+    known = known[-40:]
+    save_json(STORES_FILE, known)
+    log(f"🏪 Loja do ML aprendida: /social/{store} (vira fonte de ofertas)")
+
+
+def known_stores():
+    """Lojas do .env + as aprendidas nos canais."""
+    stores = list(ML_STORES)
+    for s in load_json(STORES_FILE, []):
+        if s and s not in stores:
+            stores.append(s)
+    return stores
+
+
+def fetch_mercado_livre_products(search_query=None):
+    """Produtos do ML.
+
+    Duas fontes, porque /ofertas e /social/ se comportam de jeito diferente:
+
+    1. /ofertas?page=N — a pagina de ofertas de verdade. requests/curl_cffi
+       nela recebem SEMPRE a parede anti-bot (HTTP 200 com "suspicious-traffic"),
+       no PC e no celular, com cookie ou sem. Sai apenas pelo Chrome de verdade
+       (Selenium), que e o que a versao anterior fazia e funcionava.
+    2. /social/<loja> — o catalogo das lojas. NUNCA e bloqueado, entao sempre
+       devolve produto com preco e titulo. Serve de reserva quando o Chrome
+       nao estiver disponivel (celular sem Selenium).
+    """
+    products = []
+    page = random.randint(1, 20)
+    page_html = browser_get(f"https://www.mercadolivre.com.br/ofertas?page={page}", wait=3)
+    if page_html is not None:
+        soup = BeautifulSoup(page_html.text, "html.parser")
         for item in soup.select("li.ui-search-layout__item, div.poly-card, .andes-card, .promotion-item, .ui-search-result"):
             try:
                 title_el = item.select_one(".poly-component__title, .ui-search-item__title, h2, a[title]")
@@ -1075,34 +1401,51 @@ def fetch_mercado_livre_products(search_query=None):
                 permalink = (link_el.get("href") if link_el else "").split("#")[0]
                 if not title or not permalink.startswith("http"):
                     continue
-
                 current = item.select_one(".andes-money-amount:not(.andes-money-amount--previous), .price-tag")
                 price = None
                 if current:
                     frac = current.select_one(".andes-money-amount__fraction, .price-tag-fraction")
                     cents = current.select_one(".andes-money-amount__cents, .price-tag-cents")
                     if frac:
-                        price = parse_money(f"{frac.get_text(strip=True).replace('.', '')}.{cents.get_text(strip=True) if cents else '00'}")
+                        price = parse_money(f"{frac.get_text(strip=True).replace('.', '')}."
+                                            f"{(cents.get_text(strip=True) if cents else '00')}")
                     else:
                         price = parse_money(current.get_text())
-
-                old_el = item.select_one(".andes-money-amount--previous, .price-tag-old, .poly-price__old")
-                old = parse_money(old_el.get_text()) if old_el else None
-
-                img = item.select_one("img")
-                thumb = (img.get("data-src") or img.get("src") or "") if img else ""
-
                 if price:
                     products.append({
                         "id": "ml_" + hashlib.md5(permalink.encode()).hexdigest()[:12],
-                        "title": title, "price": price, "original_price": old,
-                        "permalink": permalink, "thumbnail": thumb, "source": "raspagem",
+                        "title": title, "price": price, "original_price": None,
+                        "permalink": permalink,
+                        "thumbnail": ((item.select_one("img").get("data-src")
+                                       or item.select_one("img").get("src") or "")
+                                      if item.select_one("img") else ""),
+                        "source": "raspagem",
                     })
             except Exception:
                 continue
 
+    # Reserva: catalogo das lojas /social/ (nunca bloqueado)
+    wanted = _keywords(search_query) if search_query else set()
+    fallback = []
+    for store in known_stores():
+        for item in store_catalog(ML_STORE_BASE + store):
+            if wanted:
+                words = _keywords(item.get("title"))
+                if not words or not (words & wanted):
+                    continue
+            fallback.append({
+                "id": "ml_" + hashlib.md5(item["url"].encode()).hexdigest()[:12],
+                "title": item["title"], "price": item["price"],
+                "original_price": None, "permalink": item["url"],
+                "thumbnail": item.get("image") or "", "source": "loja",
+            })
+    if not products and fallback:
+        products = fallback
+        log(f"ℹ️ /ofertas não passou; usando o catálogo das lojas ({len(fallback)} produto(s)).")
+
     if not products:
-        log("⚠️ Mercado Livre: 0 produtos (provável bloqueio anti-bot). A planilha é a fonte confiável.")
+        log("⚠️ Mercado Livre: 0 produtos. Use USE_SELENIUM=1 no PC, ML_STORES no .env, "
+            "ou a planilha, que nunca é bloqueada.")
     else:
         random.shuffle(products)
         log(f"✅ Mercado Livre: {len(products)} produto(s).")
@@ -1627,6 +1970,8 @@ def channel_listener():
                 return
 
             urls = re.findall(r"https?://[^\s]+", raw)
+            for u in urls:
+                remember_store(expand_url(u.rstrip(".,)")))
             product_urls = [u for u in urls if is_product_url(u)]
             if not product_urls:
                 return
