@@ -92,6 +92,56 @@ não foi testado de verdade.
 Não foi erro HTTP, foi `ConnectionError` de proxy. A mensagem mente sobre a
 causa. Baixa prioridade.
 
+---
+
+## [ABERTA · CRÍTICA] Mercado Livre bloqueia o IP residencial (bot-wall)
+
+14/10 14:35, no celular:
+```
+⊘ www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+⚠️ Mercado Livre: 0 produtos (provável bloqueio anti-bot).
+```
+Mesmo com `curl_cffi` + `impersonate="chrome131"` e IP residencial.
+Shopee também bloqueia (403).
+
+**Opções (ver `TERMUX.md` seção 3):**
+- **Preencher a planilha** — fonte confiável, nunca é bloqueada. Atalho.
+- **Proxy residencial BR funcionando** — o antigo está morto.
+- **CDP/Chromium no Termux** — NÍVEL 2, exige reimplementar `browser_get()`.
+
+---
+
+## [ABERTA] Telethon precisa de `--login` no celular
+
+A sessão do PC não vai no clone (`.session` está no `.gitignore`, e é uma
+credencial). Rodar `python bot.py --login` no Termux.
+
+---
+
+## [ABERTA] A planilha do Google está VAZIA (verificado 14/10 14:50)
+
+CSV público retorna HTTP 200 com cabeçalho `['Link', 'Preço', 'Titulo', 'Foto']`
+e **0 linhas de dados**. As colunas batem com o que o código procura — só
+falta cadastrar produto.
+
+---
+
+## [ABERTA] `SEARCH_TERMS` é carregado do `.env` e nunca usado
+
+`bot.py` L85 é a **única ocorrência** da variável no arquivo inteiro.
+O ciclo automático só chama `fetch_mercado_livre_products()` sem argumento
+→ sempre vai em `/ofertas?page=N`.
+
+O modo por termo (`lista.mercadolivre.com.br/<termo>`) só é alcançado pelo
+comando `/buscar`. O `.env.example` documenta `SEARCH_TERMS` como se
+funcionasse no ciclo — **não funciona**.
+
+**Impacto:** é uma fonte de produtos pronta e não utilizada. Além disso
+`/ofertas` é justamente a URL mais protegida do ML, então habilitar o modo
+por termo pode ajudar no bloqueio.
+
+---
+
 ## [ABERTA · CRÍTICA] `bot.py` não sobe no Android — import do Pillow é incondicional
 
 `bot.py` L27: `from PIL import Image, ImageDraw, ImageFilter, ImageFont`

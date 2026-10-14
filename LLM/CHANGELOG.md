@@ -5,6 +5,111 @@
 
 ---
 
+## [2026-10-14 14:50] — Sessão 9: 2ª foto do Termux — correção do proxy funcionou, 3 pendências
+
+**Objetivo:** o usuário mandou nova foto (`E:\Pasta de erro\1.jpeg`, 14/10 14:35)
+do Termux rodando o `bot.py` novo, já clonado do GitHub.
+
+### Log transcrito
+
+```
+note: Total 18 (delta 0), reused 18 ... 254.46 KiB   ← clone do GitHub OK
+(venv) ~/ML/bot-ML $ ls
+LLM  'bot antigo.py'  bot.py  img  requirements.txt
+(venv) ~/ML/bot-ML $ nano .env
+(venv) ~/ML/bot-ML $ python bot.py
+>>> BOT VAGANTE PROMOÇÕES <<<
+✅ Telegram conectado como @vagantepromo_bot
+✅ Canal de destino: Vagante Promoções
+📡 Canais monitorados: @linksBrazil, @xetdaspromocoes
+✅ Instagram conectado como @vagantepromo (id 281222276434048679)
+⚠️ proxy indisponivel (ProxyError) — PROXY desligado. Seguindo com a conexão
+   direta: Mercado Livre continua funcionando, Shopee pode bloquear.
+🔍 Escutador do chat privado iniciado.
+🤖 Ciclo do Telegram: planilha + raspagem
+⚠️ Telethon: sessão expirada. Rode python bot.py --login novamente.
+📊 Planilha: 0 produto(s) válido(s).
+⊘ www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+⚠️ Mercado Livre: 0 produtos (provável bloqueio anti-bot).
+⊘ shopee.com.br bloqueou o acesso (HTTP 403).
+⚠️ Shopee bloqueada (HTTP 403).
+📋 Nenhum produto novo na planilha.
+✅ Ciclo concluído: 0 oferta(s) da raspagem publicada(s).
+📸 Instagram: fila vazia.
+```
+
+### ✅ A correção da sessão 7 FUNCIONOU
+
+- "**PROXY desligado. Seguindo com a conexão direta**" — o `PROXIES = None`
+  entrou em vigor.
+- **Toda a cascata de `ConnectionError` acabou.** Agora o bot recebe
+  respostas HTTP de verdade (200 e 403) em vez de erro de socket.
+- ✅ `curl_cffi` **está instalado** no celular (o aviso de L1514 não apareceu).
+- ✅ `Pillow` funciona.
+- ✅ O clone do GitHub funcionou (`LLM/` e `img/` estão no celular).
+
+### 🔴 Pendência 1 — Telethon: sessão expirada
+
+`⚠️ Telethon: sessão expirada. Rode python bot.py --login novamente.`
+
+**Causa:** o arquivo `session_promos.session` **não veio no clone** — está no
+`.gitignore`, corretamente. Além disso a sessão do PC não é transferível
+para o Android.
+
+**Solução:** rodar `python bot.py --login` no Termux e autenticar de novo.
+
+### 🔴 Pendência 2 — a PLANILHA ESTÁ VAZIA (verificado)
+
+Testei o CSV público daqui:
+
+```
+HTTP 200 | 22 bytes
+CABECALHO: ['Link', 'Preço', 'Titulo', 'Foto']
+LINHAS DE DADOS: 0        ← vazia
+```
+
+**Não é bug.** As colunas batem exatamente com o que `fetch_sheet_products`
+procura (`link`, `preço`, `titulo`, `foto`) — o problema é que **não há
+nenhum produto cadastrado**.
+
+**Solução:** preencher a planilha. Ela é a fonte principal e a única que
+nunca é bloqueada.
+
+### 🔴 Pendência 3 — ML e Shopee bloqueiam o IP residencial
+
+- ML: `HTTP 200, pagina de verificacao` — o bot-wall do ML, apesar do
+  `impersonate="chrome131"` do curl_cffi.
+- Shopee: `HTTP 403` — bloqueio agressivo conhecido.
+
+Isso é o **NÍVEL 2** do `TERMUX.md`: precisa de navegador de verdade (CDP
+no Termux) ou de um proxy residencial BR que funcione.
+
+### 🟡 Achado extra — `SEARCH_TERMS` é carregado e NUNCA usado
+
+```python
+L85: SEARCH_TERMS = [t.strip() for t in env("SEARCH_TERMS").split(",") if t.strip()]
+```
+
+É a **única ocorrência** no arquivo. O ciclo automático só chama
+`fetch_mercado_livre_products()` sem argumento, que vai sempre em
+`/ofertas?page=N`. O modo `lista.mercadolivre.com.br/<termo>` só é
+alcançado pelo comando `/buscar`.
+
+→ **O `SEARCH_TERMS` do `.env` não faz nada.** É um buraco de
+funcionalidade (o `.env.example` documenta como se funcionasse).
+
+**Resultado:**
+- ✅ Correção do proxy validada em campo
+- ✅ 3 pendências isoladas e com causa identificada
+- ⏳ Nenhuma alteração de código nesta sessão
+
+**Próximos passos sugeridos:**
+1. `python bot.py --login` no Termux (Telethon)
+2. Preencher a Google Sheet (fonte confiável, destrava o bot)
+3. Decidir a estratégia para ML/Shopee (proxy novo, ou CDP no Termux)
+
+---
+
 ## [2026-10-14 14:35] — Sessão 8: `.gitignore` criado para subir ao GitHub
 
 **Objetivo:** o usuário avisou que vai publicar o projeto no GitHub.
