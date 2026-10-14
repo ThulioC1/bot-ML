@@ -98,6 +98,13 @@ ML_STORE_BASE = "https://www.mercadolivre.com.br/social/"
 # barra, entao o padrao e janela real escondida fora da tela.
 USE_SELENIUM = env("USE_SELENIUM", "1").strip().lower() not in ("0", "false", "nao", "não")
 SELENIUM_HEADLESS = env("SELENIUM_HEADLESS", "0").strip().lower() in ("1", "true", "sim")
+IS_ANDROID = sys.platform == "android" or bool(os.getenv("TERMUX_VERSION"))
+
+# No Android o Selenium nao funciona (selenium-manager nao e compilado para
+# arm64), entao desligar por la evita ficar tentando e imprimindo erro.
+if IS_ANDROID:
+    USE_SELENIUM = False
+
 _DRIVER = None
 _DRIVER_LOCK = threading.Lock()
 SELENIUM_STATE = {"ok": False, "msg": "não iniciado"}
@@ -1237,8 +1244,23 @@ def cdp_get(url, wait=None, timeout=90):
     """Baixa a pagina por CDP e devolve o HTML renderizado, ou None.
 
     Passos: abre uma aba -> espera o JS rodar -> le document.outerHTML.
+    Nunca levanta excecao: devolve None e o ciclo segue com /social/<loja>.
     """
-    import websocket  # websocket-client (python puro, instala no Termux)
+    try:
+        return _cdp_get(url, wait, timeout)
+    except Exception as exc:
+        log(f"⚠️ CDP falhou em {url[:55]}: {type(exc).__name__}: {exc}")
+        _CDP["msg"] = f"{type(exc).__name__}"
+        return None
+
+
+def _cdp_get(url, wait=None, timeout=90):
+    try:
+        import websocket  # websocket-client (python puro, instala no Termux)
+    except Exception:
+        _CDP["msg"] = "websocket-client ausente (pip install websocket-client)"
+        log(f"⚠️ CDP: {_CDP['msg']} — /ofertas indisponível, usando /social/<loja>.")
+        return None
 
     base = cdp_server()
     if not base:
@@ -1768,6 +1790,9 @@ def handle_private_message(message):
             "📡 *Status das fontes*",
             f"• Planilha (Sheets): {sheet_state}",
             f"• Proxy: {PROBE_STATE['msg'] if PROXIES else 'não configurado (ML/Shopee ficam bloqueados)'}",
+            f"• Navegador: {'CDP' if IS_ANDROID else ('Selenium' if USE_SELENIUM else 'desligado')}"
+            f" — {_CDP['msg'] if IS_ANDROID else SELENIUM_STATE['msg']}",
+            f"• Lojas ML: {', '.join(known_stores()) or 'nenhuma (defina ML_STORES)'}",
             f"• Mercado Livre: {'BLOQUEADO' if 'www.mercadolivre.com.br' in BLOCKED_SOURCES else 'liberado'}",
             f"• Shopee: {'BLOQUEADO' if 'shopee.com.br' in BLOCKED_SOURCES else 'liberado'}",
             f"• Amazon: {'BLOQUEADO' if 'www.amazon.com.br' in BLOCKED_SOURCES else 'liberado'}",
@@ -2108,6 +2133,17 @@ def main():
     resolve_ig_user_id()
     if not HAVE_CURL_CFFI:
         log("⚠️ curl_cffi ausente — a raspagem pode ser bloqueada. Instale com: pip install curl_cffi")
+    if not USE_SELENIUM and not IS_ANDROID:
+        log("⚠️ Sem Selenium — o /ofertas do ML vai ficar bloqueado (o ML só abre para Chrome).")
+    if IS_ANDROID:
+        try:
+            import websocket  # noqa: F401
+            log("✅ websocket-client OK — o /ofertas será lido via Chromium CDP.")
+        except Exception:
+            log("⚠️ websocket-client ausente: rode `pip install websocket-client`, "
+                "senão o /ofertas do ML não abre e o bot usa só /social/<loja>.")
+        _bin = chromium_binary()
+        log(f"ℹ️ Navegador: {_bin or 'Chromium NÃO ENCONTRADO (pkg install chromium-browser)'}")
     if PROXIES:
         proxy_health()
     else:

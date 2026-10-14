@@ -5,6 +5,87 @@
 
 ---
 
+## [2026-10-14 16:45] — Sessão 14: foto 3 — bot MORREU por `No module named 'websocket'`
+
+**Objetivo:** o usuário mandou `E:\Pasta de erro\3.jpg` (log do Termux).
+
+### Log transcrito
+
+```
+[14/10 16:06:31] >>> BOT VAGANTE PROMOÇÕES <<<
+✅ Telegram conectado como @vagantepromo_bot
+✅ Canal de destino: Vagante Promoções
+📡 Canais monitorados: @linksBrazil, @xetdaspromocoes
+✅ Instagram conectado como @vagantepromo (id 281222276434048679)
+⚠️ proxy indisponivel (ProxyError) — PROXY desligado. Seguindo com a conexão direta...
+🔍 Escutador do chat privado iniciado.
+✅ Telethon conectado: @linksBrazil, @xetdaspromocoes        ← ✅ JÁ FUNCIONA
+🤖 Ciclo do Telegram: planilha + raspagem
+📊 Planilha: 0 produto(s) válido(s).
+⊘ www.mercadolivre.com.br bloqueou o acesso (HTTP 200, pagina de verificacao).
+⚠️ Selenium: selenium nao instalado (pip install selenium). Seguindo so com requests.
+↪️ Selenium indisponível — tentando Chromium via CDP.
+⚠️ Erro no ciclo principal: No module named 'websocket'     ← 💥 BOT MORREU
+^C[14/10 16:06:55] Encerrado pelo usuário.
+
+$ pip install selenium
+  → Successfully installed ... selenium-4.51.0 websocket_client-1.9.2 ...
+
+[14/10 16:07:29] (segunda execução — log cortado na foto)
+```
+
+### 🟢 O que deu certo
+
+- **Telethon conectado** — a sessão expirada foi resolvida.
+- A **escada de fallback funcionou**: HTTP → Selenium (falhou) → CDP.
+- O `pip install selenium` **trouxe `websocket_client-1.9.2` como dependência**,
+  então o módulo passou a existir.
+
+### 🔴 O bug: dependência opcional derrubou o bot
+
+`cdp_get` fazia `import websocket` **sem try/except**. Sem o módulo, a
+exceção subia e matava o ciclo inteiro.
+
+Pior: `browser_get` era chamado dentro de `fetch_mercado_livre_products`, que
+é chamado por `telegram_cycle` — **um navegador ausente não pode parar o bot.**
+
+### Correções aplicadas
+
+1. **`cdp_get` virou casca + `_cdp_get`**: todo o corpo num `try/except` que
+   devolve `None`. **Nenhum erro de navegador derruba mais o bot.**
+2. **`import websocket` protegido** — se faltar, avisa com o comando exato e
+   devolve `None` (o ciclo segue com `/social/<loja>`).
+3. **`IS_ANDROID`** calculado uma vez; se Android, `USE_SELENIUM = False`
+   automaticamente. Sem Selenium o `browser_get` vai direto pro CDP, sem
+   perder tempo tentando (e sem imprimir erro vermelho).
+4. **Diagnóstico no boot**: agora o Termux mostra, antes de qualquer ciclo:
+   ```
+   ✅ websocket-client OK — o /ofertas será lido via Chromium CDP.
+   ℹ️ Navegador: /data/data/com.termux/files/usr/bin/chromium-browser
+   ```
+   ou, se faltar algo:
+   ```
+   ⚠️ websocket-client ausente: rode `pip install websocket-client`...
+   ⚠️ Chromium NÃO ENCONTRADO (pkg install chromium-browser)
+   ```
+5. **`/status` no Telegram** ganhou duas linhas:
+   - `Navegador: CDP — <estado>`
+   - `Lojas ML: <lista>`
+
+### Erro meu no caminho
+
+A primeira edição do bloco de diagnóstico foi aplicada no `if PROXIES:` errado
+(dentro do `except` do `proxy_health`) e quebrou a sintaxe. Corrigido —
+`py_compile` passa e o arquivo tem **69 funções**.
+
+**Resultado:**
+- ✅ Bot não morre mais por dependência de navegador ausente
+- ✅ No Android o Selenium é desligado sozinho (vai direto pro CDP)
+- ✅ O log agora diz na hora o que está faltando
+- ⏳ **Falta ver o log da 2ª execução** (cortado na foto) — era o teste real do CDP
+
+---
+
 ## [2026-10-14 16:10] — Sessão 13: CDP no Termux — `/ofertas` funciona no celular (SEM Selenium)
 
 **Objetivo:** o usuário escolheu a opção 3 — "a prioridade é rodar no celular".
