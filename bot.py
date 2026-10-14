@@ -1221,33 +1221,84 @@ def selenium_get(url, wait=3, timeout=45):
             log(f"⚠️ Selenium: {type(exc).__name__}: {exc}")
             return None
 
-
-def chromium_binary():
-    """Acha o Chromium/Chrome. No Termux o pacote e 'chromium' (repo x11) e o
-    binario fica como 'chromium-browser'."""
-    found = env("CHROMIUM_BIN")
-    if found and os.path.exists(found):
-        return found
-    for name in ("chromium-browser", "chromium", "headless_shell",
-                 "google-chrome", "chrome", "google-chrome-stable"):
-        path = shutil.which(name)
-        if path:
-            return path
-    prefix = os.getenv("PREFIX") or "/data/data/com.termux/files/usr"
-    for pattern in (f"{prefix}/bin/chromium-browser",
-                    f"{prefix}/bin/chromium",
-                    f"{prefix}/lib/chromium/chrome",
-                    f"{prefix}/lib/chromium/headless_shell",
+def chromium_candidates():
+    """Binarios do Chromium em ordem de preferencia, com duplicados removidos."""
+    visto, lista = set(), []
+    achado = env("CHROMIUM_BIN")
+    if achado and os.path.exists(achado):
+        lista.append(achado)
+    for nome in ("chromium-browser", "chromium", "headless_shell"):
+        caminho = shutil.which(nome)
+        if caminho:
+            lista.append(caminho)
+    prefixo = os.getenv("PREFIX") or "/data/data/com.termux/files/usr"
+    for caminho in (f"{prefixo}/bin/chromium-browser",
+                    f"{prefixo}/lib/chromium/chrome",
+                    f"{prefixo}/lib/chromium/headless_shell",
+                    f"{prefixo}/bin/headless_shell",
                     "/data/data/com.termux/files/usr/bin/chromium-browser",
                     "/system/bin/chromium-browser",
                     "C:/Program Files/Google/Chrome/Application/chrome.exe",
                     "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"):
-        if os.path.exists(pattern):
-            return pattern
+        if os.path.exists(caminho):
+            lista.append(caminho)
+    for caminho in lista:
+        if caminho not in visto:
+            visto.add(caminho)
+            yield caminho
+
+
+def chromium_binary():
+    for caminho in chromium_candidates():
+        return caminho
     return None
 
 
 CHROMIUM_HINT = "pkg install x11-repo && pkg install chromium"
+
+
+def _cdp_tentar(binary, perfil, extra_args, env_extra):
+    """Sobe o Chromium e devolve (proc, url_base, motivo_da_falha)."""
+    base = f"http://{CDP_HOST}:{CDP_PORT}"
+    args = [binary,
+            "--remote-debugging-port=%d" % CDP_PORT,
+            "--remote-allow-origins=*",
+            f"--user-data-dir={perfil}",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+            "--lang=pt-BR", "--window-size=1400,1000",
+            ] + extra_args + ["about:blank"]
+
+    envp = None
+    if env_extra:
+        envp = dict(os.environ)
+        envp.update(env_extra)
+
+    log_arq = BASE_DIR / "cdp_chrome.log"
+    try:
+        fh = open(log_arq, "ab")
+    except Exception:
+        fh = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=fh, env=envp)
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    for _ in range(50):                       # ~25s esperando a porta
+        if proc.poll() is not None:
+            return None, None, f"chromium saiu (código {proc.returncode}); veja cdp_chrome.log"
+        try:
+            if requests.get(f"{base}/json/version", timeout=2).status_code == 200:
+                return proc, base, ""
+        except Exception:
+            pass
+        time.sleep(0.5)
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return None, None, "porta CDP não abriu em 25s; veja cdp_chrome.log"
 
 
 def cdp_server():
@@ -1259,57 +1310,62 @@ def cdp_server():
     except Exception:
         pass
 
-    if _CDP["proc"] is not None and time.time() - _CDP["tried_at"] < 60:
+    if _CDP["proc"] is not None and time.time() - _CDP["tried_at"] < 120:
         return None                      # ja tentou e falhou, nao fica tentando
     _CDP["tried_at"] = time.time()
 
-    binary = chromium_binary()
-    if not binary:
+    binarios = list(chromium_candidates())
+    if not binarios:
         _CDP["msg"] = "Chromium não encontrado"
+        log(f"⚠️ {CHROMIUM_HINT}")
         return None
 
-    profile = BASE_DIR / ".chrome-cdp"
-    profile.mkdir(exist_ok=True)
-    args = [
-        binary,
-        "--remote-debugging-port=%d" % CDP_PORT,
-        "--remote-allow-origins=*",
-        "--user-data-dir=%s" % profile,
-        "--no-first-run", "--no-default-browser-check",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
-        "--lang=pt-BR", "--window-size=1400,1000",
-        "about:blank",
-    ]
-    # No Termux o Chromium e ET_DYN: precisa de LD_PRELOAD para rodar, e
-    # --single-process porque o LD_PRELOAD quebra o zygote do Android.
-    if sys.platform == "android" or os.getenv("TERMUX_VERSION"):
-        envp = dict(os.environ)
-        envp["LD_PRELOAD"] = "libtermux-exec.so"
-        args.insert(1, "--single-process")
-        args.insert(1, "--no-zygote")
+    perfil = BASE_DIR / ".chrome-cdp"
+    try:
+        perfil.mkdir(exist_ok=True)
+    except Exception:
+        perfil = None
+
+    no_android = bool(sys.platform == "android" or os.getenv("TERMUX_VERSION"))
+    prefixo = os.getenv("PREFIX") or "/data/data/com.termux/files/usr"
+    preload = f"{prefixo}/lib/libtermux-exec.so"
+    tem_preload = os.path.exists(preload)
+
+    # No Android nao existe display: Chromium sobe em headless. E como binario
+    # em app-data e ET_DYN, precisa do LD_PRELOAD para rodar; o --single-process
+    # existe porque o LD_PRELOAD quebra o zygote. Tentamos varias combinacoes.
+    if no_android:
+        variantes = [
+            (["--headless=new", "--no-zygote", "--single-process"],
+             {"LD_PRELOAD": preload} if tem_preload else None),
+            (["--headless=new"], {"LD_PRELOAD": preload} if tem_preload else None),
+            (["--headless=new", "--no-zygote", "--single-process"], None),
+            (["--headless"], None),
+        ]
     else:
-        envp = None
+        variantes = [([], None)]
 
     try:
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, env=envp)
-        _CDP["proc"] = proc
-    except Exception as exc:
-        _CDP["msg"] = f"não subiu ({type(exc).__name__})"
-        return None
+        (BASE_DIR / "cdp_chrome.log").unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    for _ in range(40):                    # espera a porta abrir
-        time.sleep(0.5)
-        try:
-            if requests.get(f"{base}/json/version", timeout=2).status_code == 200:
+    motivos = []
+    for binary in binarios:
+        for extra, env_extra in variantes:
+            proc, url, motivo = _cdp_tentar(binary, perfil, extra, env_extra)
+            if url:
+                _CDP["proc"] = proc
                 _CDP["msg"] = "Chromium CDP ativo"
-                log(f"✅ Chromium CDP ativo em {base} ({os.path.basename(binary)})")
-                return base
-        except Exception:
-            continue
-    _CDP["msg"] = "porta CDP não abriu"
-    log(f"⚠️ Chromium CDP: {_CDP['msg']}")
+                log(f"✅ Chromium CDP ativo em {url} "
+                    f"({os.path.basename(binary)}{' ' + ' '.join(extra) if extra else ''})")
+                return url
+            motivos.append(f"{os.path.basename(binary)}[{' '.join(extra) or 's/tela'}]: {motivo}")
+
+    _CDP["msg"] = motivos[0] if motivos else "não subiu"
+    log("⚠️ Chromium CDP não subiu. Tentativas:")
+    for motivo in motivos[:6]:
+        log(f"   • {motivo}")
     return None
 
 

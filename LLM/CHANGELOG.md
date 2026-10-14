@@ -5,6 +5,78 @@
 
 ---
 
+## [2026-10-14 17:55] — Sessão 17: Chromium instalado mas "porta CDP não abriu"
+
+**Objetivo:** o usuário instalou o Chromium e o bot respondeu
+`⚠️ Chromium CDP: porta CDP não abriu`.
+
+### 🟢 Boa notícia: o Chromium ESTÁ instalado
+
+O `chromium_binary()` achou o binário (o log deixou de dizer "não
+encontrado"). O problema é **o Chromium não subiu com a porta CDP**.
+
+### 🔴 Causa provável: faltava `--headless`
+
+No celular **não existe display**. Minha versão anterior subia o Chromium
+**sem `--headless`**, então no PC funcionava (tem tela) mas no Android ele
+não abre janela e morre antes de escutar a porta.
+
+Segundo problema: eu passava `LD_PRELOAD=libtermux-exec.so` com caminho
+**relativo** — precisa ser absoluto
+(`/data/data/com.termux/files/usr/lib/libtermux-exec.so`).
+
+### Correção: máquina de tentativas
+
+`cdp_server()` agora tenta **várias combinações** até uma dar certo, e
+**registra o erro de cada uma**:
+
+```python
+variantes = [
+    (["--headless=new", "--no-zygote", "--single-process"], {"LD_PRELOAD": preload}),
+    (["--headless=new"],                                    {"LD_PRELOAD": preload}),
+    (["--headless=new", "--no-zygote", "--single-process"],  None),
+    (["--headless"],                                        None),
+]
+```
+× cada binário candidato (`chromium-browser`, `chromium`, `headless_shell`,
+`$PREFIX/lib/chromium/chrome`, …).
+
+Outras mudanças:
+- **`LD_PRELOAD` com caminho absoluto** e só quando o arquivo existe.
+- **stderr do Chromium vai para `cdp_chrome.log`** (antes era descartado) —
+   é isso que vai dizer o motivo real da falha.
+- Espera da porta subiu de 20s para 25s, e agora detecta se o processo
+  **morreu** (`chromium saiu (código N)`) em vez de só esperar a timeout.
+- `chromium_binary()` virou gerador `chromium_candidates()` para testar
+  vários binários.
+- Cache de falha subiu de 60s para 120s (não fica tentando toda hora).
+
+A mensagem final passa a listar tudo que foi tentado:
+```
+⚠️ Chromium CDP não subiu. Tentativas:
+   • chrome[--headless=new --no-zygote --single-process]: porta CDP não abriu em 25s
+   • chrome[--headless=new]: chromium saiu (código 127); veja cdp_chrome.log
+   ...
+```
+
+### Validado no PC
+
+```
+candidatos: C:/Program Files/Google/Chrome/Application/chrome.exe
+✅ Chromium CDP ativo em http://127.0.0.1:9222 (chrome.exe)   (5.8s)
+cdp_get /ofertas -> OK 663.014 bytes | MLB-ids: 119
+```
+
+**Resultado:**
+- ✅ Provável causa corrigida (`--headless` faltando + LD_PRELOAD relativo)
+- ✅ 4 combinações × N binários, com diagnóstico de cada tentativa
+- ✅ `cdp_chrome.log` para o próximo teste no celular
+
+**Se ainda falhar:** pedir para mandar o `cdp_chrome.log` do celular —
+ele vai dizer o erro exato (falta de biblioteca, permissão, etc.).
+
+---
+
 ## [2026-10-14 17:40] — Sessão 16: `pkg install chromium-browser` não existe
 
 **Objetivo:** o usuário rodou `pkg install chromium-browser` e recebeu
