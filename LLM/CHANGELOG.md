@@ -5,6 +5,82 @@
 
 ---
 
+## [2026-10-15 15:45] — Sessão 24: o título vinha sendo a frase do parceiro
+
+**Objetivo:** o usuário: *"quando pegamos o texto do grupo aliado, precisamos
+pegar da linha de baixo. Pois nosso parceiro põe uma frase e eu prefiro que
+venha o título primeiro sem frase."*
+
+### 🔴 O que acontecia
+
+O handler escolhia o título assim:
+
+```python
+for l in _lines:
+    if len(l) > 12 and "http" not in l and not l.startswith("-"):
+        title_guess = l[:150]
+        break          # <- primeira linha que passa, e a frase do parceiro
+```
+
+Post real do canal:
+```
+MIXER É AVANÇO DE VIDA              <- 1a linha: frase de divulgacao
+Mixer Power Inox 3 em 1 600W ...    <- linha de baixo: o TITULO
+De R$ 191 por R$ 110 no Pix
+```
+
+Duas consequências:
+1. Quando a extração na página do produto falhava (ML bloqueado, link de loja),
+   o post saía com **`MIXER É AVANÇO DE VIDA`** como título.
+2. O mesmo `title_guess` ia para o `resolve_store_link()` — ou seja, a busca do
+   produto na loja casava pela **frase**, não pelo nome. Isso degrada a
+   resolução de link de loja, que é o que gera comissão.
+
+### ✅ `title_from_lines()` (novo)
+
+Substitui o `for/break`. Regras em ordem:
+
+1. Linha com **http**, com **preço** ou muito curta **não** é título.
+2. Frase em **CAIXA ALTA** e curta perde para qualquer título normal.
+3. Se **só** sobrar frase, pula a 1ª linha e usa a de baixo.
+4. Entre as normais, a 1ª vence — **exceto** se for isca curta
+   (`"Olha isso:"`, `"Corre que ta saindo:"`, `"Preço imperdível!"` → termina
+   em `: ! ? -`), caso em que usa a linha seguinte.
+
+### Testado — 13/13
+
+| Caso | Resultado |
+|---|---|
+| **foto real** (frase caixa alta na 1ª) | `Mixer Power Inox 3 em 1 600W Elgin 110V` ✅ |
+| título é a única linha | usa a 1ª linha ✅ |
+| título na 1ª + frase caixa alta na 2ª | vence a 1ª ✅ |
+| duas frases caixa alta + título embaixo | pega o título ✅ |
+| frase com acento caixa alta | pega o título ✅ |
+| linha de preço isolada | nunca vira título ✅ |
+| só preço + link | devolve vazio → cai em "Oferta" ✅ |
+| duas linhas normais | vence a 1ª ✅ |
+| isca `"Olha isso:"` + título | pega o título ✅ |
+| título longo na 1ª | **não** troca só por ser maior ✅ |
+| `"Corre que ta saindo:"` + título | pega o título ✅ |
+| emoji na frase (`🔥 OFERTA...`) | pega o título ✅ |
+
+### Duas versões antes de acertar
+
+A primeira versão aplicava "pula a 1ª linha" **antes** de checar a caixa alta,
+e **quebrou 2 casos legítimos**: quando o título *era* a 1ª linha, ele era
+descartado. A ordem correta é **caixa alta primeiro, pular a 1ª linha só como
+último recurso**.
+
+### Arquivos alterados
+- `bot.py` — `title_from_lines()` (novo), handler do Telethon
+- `LLM/CHANGELOG.md`, `LLM/PROJECT_STATE.md` — esta sessão
+
+**Resultado:**
+- ✅ Título vem do produto, não da frase de divulgação
+- ✅ `resolve_store_link()` passa a casar pelo nome do produto (ganha comissão)
+
+---
+
 ## [2026-10-15 15:10] — Sessão 23: as fotos pararam de funcionar (era o botão) + preço antigo
 
 **Objetivo:** o usuário reclamou que *"após essas últimas mudanças o Telegram

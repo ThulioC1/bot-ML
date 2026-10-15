@@ -53,7 +53,33 @@ Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo
 
 → **Sempre `json.dumps()` em `reply_markup`**, e **teste o caminho com foto**.
 
-**Funções novas desta sessão:** `prices_from_text()` e a constante `_MONEY_RE`.
+**Funções novas destas sessões:** `prices_from_text()` + `_MONEY_RE` (sessão 23)
+e `title_from_lines()` (sessão 24).
+
+## 🆕 Sessão 24 — De onde vem o título do post (15/10)
+
+O canal manda **frase de divulgação primeiro, título depois**:
+```
+MIXER É AVANÇO DE VIDA              <- frase, NÃO é o título
+Mixer Power Inox 3 em 1 600W Elgin  <- título (linha de baixo)
+De R$ 191 por R$ 110 no Pix
+```
+
+`title_from_lines()` escolhe a linha certa. Ordem das regras:
+
+1. linha com **http**, com **preço** ou curta demais não é título;
+2. frase em **CAIXA ALTA** e curta perde para o título normal;
+3. se só sobrar frase, pula a 1ª linha;
+4. entre as normais, a 1ª vence — **exceto** isca curta terminado em
+   `: ! ? -` (`"Olha isso:"`), aí usa a linha seguinte.
+
+> **Ordem importa:** testar "caixa alta" **antes** de "pular a 1ª linha".
+> Na ordem invertida, quando o título *era* a 1ª linha ele era descartado
+> (erro cometido e corrigido na Sessão 24).
+
+O `title_guess` também alimenta o `resolve_store_link()` — ou seja, escolher
+a linha certa **melhora a comissão**, porque a busca na loja passa a casar pelo
+nome do produto em vez da frase.
 
 ## O que é
 

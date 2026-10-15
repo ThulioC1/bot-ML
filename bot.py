@@ -1168,6 +1168,56 @@ def prices_from_text(text):
     return atual, antigo
 
 
+def title_from_lines(lines):
+    """Escolhe a linha que e o TITULO do produto, ignorando a frase do parceiro.
+
+    Os canais comecam com uma frase de divulgacao e so depois vem o nome:
+        MIXER E AVANCO DE VIDA          <- frase (1a linha, nao e o titulo)
+        Mixer Power Inox 3 em 1 600W    <- titulo (linha de baixo)
+
+    Ordem das regras:
+      1. linhas com http, preco ou muito curtas nao sao titulo;
+      2. frase em CAIXA ALTA e curta perde para qualquer titulo normal;
+      3. se SOBRAR so frase, pula a 1a linha e usa a de baixo;
+      4. dentro das normais, a primeira vence — a menos que ela seja um
+         isca bem curta e a seguinte seja bem mais longa (titulo partido).
+    """
+    candidatas = []
+    for i, l in enumerate(lines):
+        if "http" in l.lower() or len(l) < 8:
+            continue
+        if re.search(r"R\$\s*\d", l):          # linha de preco
+            continue
+        letras = [c for c in l if c.isalpha()]
+        if not letras:
+            continue
+        caixa_alta = sum(1 for c in letras if c.isupper()) / len(letras)
+        propaganda = caixa_alta > 0.85 and len(l) < 70
+        candidatas.append((i, l, propaganda))
+
+    if not candidatas:
+        return ""
+
+    normais = [c for c in candidatas if not c[2]]      # regra 2
+    if normais:
+        melhor = normais[0]                           # regra 4
+        # isca curta de divulgacao: "Olha isso:", "Corre que ta saindo:",
+        # "Preço imperdível!" — a pontuação entrega que nao e o titulo.
+        isca = (len(melhor[1]) < 30
+                and melhor[1].rstrip().endswith((":", "!", "?", "-", "—")))
+        if not isca and len(melhor[1]) < 25:
+            mais_longo = max(normais, key=lambda c: len(c[1]))
+            if len(mais_longo[1]) > len(melhor[1]) * 2:
+                melhor = mais_longo
+        elif isca and len(normais) > 1:
+            melhor = normais[1]
+        return melhor[1][:150]
+
+    abaixo = [c for c in candidatas if c[0] > 0]      # regra 3
+    escolhido = (abaixo or candidatas)[0]
+    return escolhido[1][:150]
+
+
 def price_block(preco, preco_original):
     if preco_original and preco and preco_original > preco:
         return f"📉 De R$ {brl(preco_original)}\n🔥 Por R$ {brl(preco)}"
@@ -2321,11 +2371,9 @@ def channel_listener():
             # de loja so vira link de produto se a busca souber o que procurar.
             price, old_price = prices_from_text(raw)
             _lines = [l.strip() for l in raw.split("\n") if l.strip()]
-            title_guess = ""
-            for l in _lines:
-                if len(l) > 12 and "http" not in l and not l.startswith("-"):
-                    title_guess = l[:150]
-                    break
+            # O parceiro escreve uma frase de divulgacao na 1a linha; o titulo
+            # vem na linha de baixo. title_from_lines() pula a frase.
+            title_guess = title_from_lines(_lines)
 
             # 2. Substitui TODOS os links pelos links com o seu codigo de afiliado
             affiliate_urls = {}
@@ -2356,6 +2404,7 @@ def channel_listener():
                 old_price = old_price or data.get("original_price")
 
             if not title:
+                # ultimo recurso: qualquer linha util, senao um placeholder
                 title = title_guess or (_lines[0][:150] if _lines else "Oferta")
 
             log(f"📡 Canal: {title[:45]} | foto={'sim' if image else 'nao'} "
