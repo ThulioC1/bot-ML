@@ -5,7 +5,33 @@
 
 ---
 
-## [2026-10-15 08:15] — Sessão 21: filtro de oferta (shampoo de 24k passou)
+## [2026-10-15 12:30] — Sessão 22: link como botão no Telegram, título sem duplicata, footer corrigido
+
+**Objetivo:** melhorar a apresentação das mensagens no Telegram - link como botão inline, título único e footer de afiliado corrigido.
+
+**Arquivos alterados:**
+- `bot.py` — `send_message()` agora aceita `reply_markup`; canal handler usa teclado inline `💗 Ver Oferta`; `FOOTER_TEXT` removido emoji quebrado; título definido somente uma vez com `if not title:`
+
+**O que foi implementado**
+
+| Feature | Antes | Depois |
+|---|---|---|
+| Link de afiliado | Texto gigante `🛒 Link: https://...` | Botão inline `💗 Ver Oferta` |
+| Título da oferta | Poderia ser duplicado de fontes múltiplas | Definido apenas uma vez, `if not title:` |
+| Footer "afiliado" | `🔗 Links afiliados...` com emoji quebrado | `Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo` |
+| Preço antigo | Já era exibido via `price_block()` | Mantido (De R$ X → Por R$ Y) |
+
+**Resultado:**
+- ✅ Link agora é botão clicável no Telegram
+- ✅ Título não se duplica mais
+- ✅ Footer de afiliado limpo e sem emoji quebrado
+- ✅ Preço antigo continua aparecendo quando houver desconto
+
+### `LLM/CHANGELOG.md` — esta entrada
+### `LLM/PROJECT_STATE.md` — sem alterações necessárias
+### `LLM/ISSUES.md` — Issues resolvidas nesta sessão
+
+---
 
 **Objetivo:** o usuário pediu ponderação de valores para só entrar promoção de
 verdade — *"Ontem veio um Shampoo de 24k"*.

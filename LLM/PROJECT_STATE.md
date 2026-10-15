@@ -1,10 +1,10 @@
 # Estado do Projeto
 
 > Última atualização: 2026-10-14 (sessão 3 — `bot.py` recuperado)
-
 ## ✅ O código principal voltou
 
 `bot.py` está na pasta: **1.261 linhas / 58.847 bytes / 47 funções.**
+
 Já tem backup em `bot.py.backup`.
 
 ⚠️ **Mas não é a versão mais recente.** Existiu uma versão maior
@@ -15,6 +15,19 @@ documentada:
 → **`RECOVERY_bot_py.md`** — spec completa (o que falta)
 → **`RECOVERY_bot_py_from_pyc.txt`** — disassembly bruto (636 KB)
 → `bot.py.pyc-backup` — cópia do bytecode fora do `__pycache__`
+
+## 🆕 Sessão 22 — Interface do Telegram melhorada (15/10)
+
+**O que mudou:**
+- Link de afiliado agora aparece como botão inline `💗 Ver Oferta` no Telegram
+- Título da oferta definido apenas uma vez (sem duplicata)
+- Texto "afiliado" no footer corrigido (removido emoji quebrado)
+- Formato `De R$ X → Por R$ Y` para preços com desconto continua funcionando
+
+**Arquivos alterados:**
+- `bot.py` — `send_message()` agora aceita `reply_markup`; canal handler usa teclado inline; `FOOTER_TEXT` atualizado; título com `if not title:` guard
+
+⚠️ **Versão mais antiga nunca foi salva em disco.** Só existe como bytecode.
 
 ## O que é
 

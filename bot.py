@@ -76,7 +76,7 @@ ML_MATT_TOOL = env("ML_MATT_TOOL") or env("ML_AFFILIATE_TOOL_ID")
 SHOPEE_TAG = env("SHOPEE_TAG") or env("SHOPEE_AFFILIATE_ID")
 AMAZON_TAG = env("AMAZON_TAG")
 
-FOOTER_TEXT = env("FOOTER", "🔗 Links afiliados. Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo")
+FOOTER_TEXT = env("FOOTER", "Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo")
 
 SHEET_CSV_URL = env(
     "SHEET_CSV_URL",
@@ -717,7 +717,7 @@ def notify_admin(text):
         pass
 
 
-def send_message(text, chat_id=None, photo_url=None, reply_to=None):
+def send_message(text, chat_id=None, photo_url=None, reply_to=None, reply_markup=None):
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN or not chat_id:
         log("⚠️ Token ou Chat ID do Telegram ausentes.")
@@ -727,6 +727,8 @@ def send_message(text, chat_id=None, photo_url=None, reply_to=None):
         payload = {"chat_id": chat_id, "caption": text[:1024]}
         if reply_to:
             payload["reply_to_message_id"] = reply_to
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
 
         local = download_image(photo_url)
         if local:
@@ -747,6 +749,8 @@ def send_message(text, chat_id=None, photo_url=None, reply_to=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     return bool(tg_api("sendMessage", payload))
 
 
@@ -1949,11 +1953,15 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
     if aviso:
         lines += [aviso, ""]
     lines += [f"🛒 Link: {link}"]
-    if chat_id is None:
-        lines += ["", FOOTER_TEXT]
 
+    # Cria botão inline com o link afiliado
+    keyboard = {
+        "inline_keyboard": [[{"text": "💗 Ver Oferta", "url": link}]]
+    }
+    lines += ["", ""]
     text = "\n".join(lines)
-    ok = send_message(text, chat_id=chat_id, photo_url=product.get("thumbnail") or None, reply_to=reply_to)
+
+    ok = send_message(text, chat_id=chat_id, photo_url=product.get("thumbnail") or None, reply_to=reply_to, reply_markup=keyboard)
 
     if ok:
         seen = load_json(SEEN_FILE)
@@ -2314,9 +2322,21 @@ def channel_listener():
                 notify_admin(f"⚠️ Oferta do canal ignorada por comissao: "
                              f"{link_aviso}\n{title[:70]}")
                 return
-            send_message(f"{text}\n\n{FOOTER_TEXT}", photo_url=image)
+            # 5. Monta o post com preço e link como botão inline
+            price_display = price_block(price, None)
+            lines = [f"🔥 OFERTA", "", f"📦 {title}", ""]
+            if price_display:
+                lines += price_display.split("\n") + [""]
+            lines += [f"🛒 Link: {link}"]
+            # Cria teclado inline
+            keyboard = {
+                "inline_keyboard": [[{"text": "💗 Ver Oferta", "url": link}]]
+            }
+            lines += ["", ""]
+            text = "\n".join(lines) + f"\n\n{FOOTER_TEXT}"
+            send_message(text, photo_url=image, reply_markup=keyboard)
             save_to_vitrine({"id": "ch_" + hashlib.md5(link.encode()).hexdigest()[:10],
-                             "title": title, "price": price, "original_price": None,
+                             "title": title, "price": price, "original_price": product.get("original_price"),
                              "link": link, "image": image or ""})
 
         log(f"👂 Telethon conectado: {', '.join(SOURCE_CHANNELS)}")
