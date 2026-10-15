@@ -1831,13 +1831,27 @@ def extract_product(url):
 # --------------------------------------------------------------------------
 
 def save_to_vitrine(item):
+    """Grava na vitrine local E publica na bio (vagantepromo.vercel.app).
+
+    Item sem preço é DESCARTADO: a página da bio faz `p.price.toFixed(2)` sem
+    nenhuma proteção, então um único item com price=null quebra a vitrine
+    INTEIRA na tela do visitante. Ofertas de canal sem preço continuam indo
+    para o Telegram, só não entram na bio.
+    """
+    preco = item.get("price")
+    if preco is None or (isinstance(preco, (int, float)) and preco <= 0):
+        log(f"⚠️ Vitrine: '{str(item.get('title'))[:40]}' sem preço — não entra na bio.")
+        return
     vitrine = load_json(VITRINE_FILE, [])
+    # limpa qualquer item quebrado que tenha ficado de execuções antigas
+    vitrine = [v for v in vitrine if isinstance(v, dict)
+               and isinstance(v.get("price"), (int, float)) and v.get("price") > 0]
     if any(v.get("link") == item.get("link") for v in vitrine[:20]):
         return
     vitrine.insert(0, {
         "id": item["id"],
         "title": item["title"],
-        "price": item.get("price"),
+        "price": preco,
         "original_price": item.get("original_price"),
         "link": item["link"],
         "image": item.get("image") or "",

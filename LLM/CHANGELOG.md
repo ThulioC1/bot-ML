@@ -5,6 +5,94 @@
 
 ---
 
+## [2026-10-15 07:45] — Sessão 20: bio quebrava com 1 item sem preço
+
+**Objetivo:** usuário mandou `2.jpeg` — a página
+`vagantepromo.vercel.app` mostrava *"Erro ao carregar a vitrine de ofertas.
+Tente novamente mais tarde."*
+
+### 🔴 Causa raiz
+
+A página tem isto, **sem nenhuma proteção**:
+
+```js
+<div class="text-xl font-black text-emerald-400">R$ ${p.price.toFixed(2)...}</div>
+```
+
+E a vitrine tinha **7 itens com `price: null`** (todos ids `ch_*`, vindos do
+espelho dos canais, que publicam sem preço — como o
+`📡 Canal: Jogo De Toalhas... | preco=` do log).
+
+`null.toFixed(2)` → **TypeError** → estoura dentro do `renderProducts` → cai
+no `catch` do `loadProducts` → **a vitrine INTEIRA não renderiza**.
+Um só item quebrado mata a página toda.
+
+### Diagnóstico
+
+```
+vitrine no ar: 40 itens | sem preço: 7
+   ch_087da0f9f1 | price=None | 🔥 App - Nova chance de girar a Roleta Shopee
+   ch_0837f4224b | price=None | 🔥 Cupons Shopee
+   ch_a6e548c5b3 | price=None | 🔥 App - Roleta shopee
+   ch_c4aa0ed5fd | price=None | SHOPEE DIA DE CUPONS RENOVADOS
+   ch_105ee022a5 | price=None | 🔥 Cupons Shopee Renovados
+   ch_c711644cd5 | price=None | Live Streaming
+   ch_23baa85649 | price=None | Live Streaming
+```
+
+O blob estava **perfeito** (HTTP 200, JSON válido, 40 itens) — o defeito era
+de dados, não de transporte.
+
+### Correções
+
+1. **`save_to_vitrine()` agora recusa item sem preço** — e limpa itens
+   quebrados que ficaram de execuções anteriores:
+   ```python
+   preco = item.get("price")
+   if preco is None or (isinstance(preco, (int, float)) and preco <= 0):
+       log(f"⚠️ Vitrine: '...' sem preço — não entra na bio.")
+       return
+   vitrine = [v for v in vitrine if isinstance(v, dict)
+              and isinstance(v.get("price"), (int, float)) and v.get("price") > 0]
+   ```
+   > Oferta de canal sem preço **continua indo para o Telegram** — só não
+   > entra na bio. Faz sentido: o Telegram mostra o texto, a bio é uma
+   > vitrine de compras e precisa de preço.
+
+2. **Vitrine de produção limpa**: baixei do blob, removi os 7 quebrados e
+   reenviei. De 40 → **33 itens**, todos com preço.
+
+### Detalhe do CDN (observado)
+
+O `PUT` respondeu 200, mas as leituras seguintes ainda serviam a versão
+antiga. Só na 3ª leitura (após ~18s) veio a nova:
+
+```
+leitura 1: Age=436 | 40 itens | sem preco=7
+leitura 2: Age=442 | 40 itens | sem preco=7
+leitura 3: Age=449 | 33 itens | sem preco=0   ← propagou
+```
+
+A página usa `?t=Date.now()`, que busta o cache do visitante, então está
+ok. Mas em testes vale esperar alguns segundos antes de concluir que o
+upload não pegou.
+
+### ⚠️ Pendente do lado da página (não é do bot)
+
+O `renderProducts` continua vulnerável a `price` nulo. O bot deixou de
+mandar, mas a defesa real seria no JS da página:
+```js
+const preco = Number(p.price) || 0;
+```
+Recomendo aplicar — protege contra qualquer item futuro quebrado.
+
+**Resultado:**
+- ✅ Vitrine publicada com 33 itens válidos
+- ✅ Bot não publica mais item sem preço
+- ⏳ Recomendado: proteger `p.price` também no JS da página
+
+---
+
 ## [2026-10-14 18:20] — Sessão 19: internet cai no celular → o bot ficava parado
 
 **Objetivo:** o usuário completou: *"Às vezes em deslocamento o celular fica
