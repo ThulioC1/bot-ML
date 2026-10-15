@@ -5,6 +5,73 @@
 
 ---
 
+## [2026-10-15 08:15] — Sessão 21: filtro de oferta (shampoo de 24k passou)
+
+**Objetivo:** o usuário pediu ponderação de valores para só entrar promoção de
+verdade — *"Ontem veio um Shampoo de 24k"*.
+
+**Arquivos alterados:**
+- `bot.py` — `MIN_PRICE`/`MAX_PRICE`/`MIN_DISCOUNT`, `_num_env()`,
+  `oferta_valida()`, filtro em `collect_products()`, linha no `/status`
+- `.env.example` — seção "Filtro de oferta" + seção "Lojas do ML"
+- `LLM/CHANGELOG.md` — esta entrada
+
+### O que foi implementado
+
+| Variável | Default | Efeito |
+|---|---|---|
+| `MIN_PRICE` | 15 | descarta abaixo (preso demais, brinde) |
+| `MAX_PRICE` | 2500 | **descarta o shampoo de 24k** |
+| `MIN_DISCOUNT` | 0 | desconto mínimo em % (0 = aceita sem) |
+
+Filtro aplicado em `collect_products()`, ou seja, vale para **todas** as
+fontes (planilha, ML, Shopee, Amazon) — não só a raspagem.
+
+### Testado
+
+```
+DESCARTA  Shampoo 24k (o que passou)    R$ 24.000,00 acima do máximo
+DESCARTA  Console PS5                   R$ 4.399,90 acima do máximo
+ACEITA   Camisa 49,90
+ACEITA   Fone 199,90
+DESCARTA  Preso demais (2 reais)        R$ 2,00 abaixo do mínimo
+ACEITA   Oferta real 46,90 de 96
+DESCARTA  Preço nulo / zero             sem preço
+ACEITA   2499 (limite)  |  DESCARTA 2501
+```
+
+E no fluxo real:
+```
+🧹 Filtro de oferta: 3 descartado(s) [1 acima do máximo, 1 acima do máximo, 1 abaixo do mínimo]
+sobraram 3 de 6: R$ 49,90 | R$ 199,90 | R$ 780,00
+```
+
+### Por que `MIN_DISCOUNT` está em 0
+
+Nos itens vindos do catálogo `/social/`, **o preço antigo não vem** —
+`store_catalog()` só pega `{title, price, url, image}`. Então exigir desconto
+derrubaria **todas** as ofertas do ML. Por isso o default é 0.
+
+Para quem vem com `original_price` (Shopee, alguns itens da planilha), dá
+para exigir:
+```ini
+MIN_DISCOUNT=20
+```
+Testado: com 20%, só passa `46,90 de 96`.
+
+### `ML_STORES` documentado
+
+O usuário vai usar a vitrine dele depois, mas não agora. A variável já
+existia no código e **não está no `.env`** — documentei no `.env.example` com
+explicação, e o bot funciona sem ela (usa só as lojas que aprende nos canais).
+
+**Resultado:**
+- ✅ Shampoo de 24k descartado
+- ✅ Filtro vale para todas as fontes
+- ✅ Log mostra quantos foram descartados e por quê
+
+---
+
 ## [2026-10-15 07:45] — Sessão 20: bio quebrava com 1 item sem preço
 
 **Objetivo:** usuário mandou `2.jpeg` — a página

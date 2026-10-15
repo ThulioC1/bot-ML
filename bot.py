@@ -130,6 +130,22 @@ INTERVAL_TELEGRAM = int(env("INTERVAL_TELEGRAM", "3600") or 3600)
 INTERVAL_INSTAGRAM = int(env("INTERVAL_INSTAGRAM", "10800") or 10800)
 POSTS_PER_CYCLE = int(env("POSTS_PER_CYCLE", "2") or 2)
 
+
+def _num_env(nome, padrao):
+    """Le um numero do .env; devolve o padrao se vier vazio/quebrado."""
+    bruto = env(nome, "").replace(".", "").replace(",", ".")
+    try:
+        return float(bruto)
+    except (TypeError, ValueError):
+        return float(padrao)
+
+
+# Filtro de oferta: sem isso passa shampoo de R$ 24.000 e console de R$ 5.000,
+# que nao sao promocao de nada.
+MIN_PRICE = _num_env("MIN_PRICE", 15)
+MAX_PRICE = _num_env("MAX_PRICE", 3000)
+MIN_DISCOUNT = _num_env("MIN_DISCOUNT", 0)      # 0 = nao exige desconto
+
 SEEN_FILE = BASE_DIR / "seen.json"
 IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
 VITRINE_FILE = BASE_DIR / "vitrine.json"
@@ -1708,12 +1724,51 @@ def fetch_amazon_products(search_query=None):
     return products
 
 
+def oferta_valida(product):
+    """A oferta presta? Devolve (ok, motivo) para o log mostrar o descarte."""
+    preco = product.get("price")
+    if not isinstance(preco, (int, float)) or preco <= 0:
+        return False, "sem preço"
+    if MIN_PRICE > 0 and preco < MIN_PRICE:
+        return False, f"R$ {brl(preco)} abaixo do mínimo"
+    if MAX_PRICE > 0 and preco > MAX_PRICE:
+        return False, f"R$ {brl(preco)} acima do máximo"
+    if MIN_DISCOUNT > 0:
+        antigo = product.get("original_price")
+        if not isinstance(antigo, (int, float)) or not antigo or antigo <= preco:
+            return False, "sem desconto real"
+        desconto = (antigo - preco) / antigo * 100
+        if desconto < MIN_DISCOUNT:
+            return False, f"desconto de só {desconto:.0f}%"
+    return True, ""
+
+
 def collect_products(include_scrape=True, search_query=None):
     products = fetch_sheet_products()
     if search_query:
-        products += fetch_mercado_livre_products(search_query) + fetch_shopee_products(search_query) + fetch_amazon_products(search_query)
+        products += (fetch_mercado_livre_products(search_query)
+                     + fetch_shopee_products(search_query)
+                     + fetch_amazon_products(search_query))
     elif include_scrape:
         products += fetch_mercado_livre_products() + fetch_shopee_products()
+
+    # Filtro de oferta: descarta preco absurdo (shampoo de 24k, console de 5k)
+    # e, se pedido, exige desconto real.
+    if MIN_PRICE > 0 or MAX_PRICE > 0 or MIN_DISCOUNT > 0:
+        bons, descartados = [], {}
+        for p in products:
+            ok, motivo = oferta_valida(p)
+            if ok:
+                bons.append(p)
+            else:
+                chave = motivo.split(" R$")[0].split(" só")[0]
+                descartados[chave] = descartados.get(chave, 0) + 1
+        if descartados:
+            resumo = ", ".join(f"{v} {k}" for k, v in
+                               sorted(descartados.items(), key=lambda x: -x[1])[:4])
+            log(f"🧹 Filtro de oferta: {len(products) - len(bons)} descartado(s) [{resumo}]")
+        products = bons
+
     random.shuffle(products)
     return products
 
@@ -1962,6 +2017,8 @@ def handle_private_message(message):
             f"• Proxy: {PROBE_STATE['msg'] if PROXIES else 'não configurado (ML/Shopee ficam bloqueados)'}",
             f"• Navegador: {'CDP' if IS_ANDROID else ('Selenium' if USE_SELENIUM else 'desligado')}"
             f" — {_CDP['msg'] if IS_ANDROID else SELENIUM_STATE['msg']}",
+            f"• Filtro: R$ {brl(MIN_PRICE)}–{brl(MAX_PRICE)}"
+            f"{f' | desconto mín. {MIN_DISCOUNT:.0f}%' if MIN_DISCOUNT > 0 else ''}",
             f"• Lojas ML: {', '.join(known_stores()) or 'nenhuma (defina ML_STORES)'}",
             f"• Mercado Livre: {'BLOQUEADO' if 'www.mercadolivre.com.br' in BLOCKED_SOURCES else 'liberado'}",
             f"• Shopee: {'BLOQUEADO' if 'shopee.com.br' in BLOCKED_SOURCES else 'liberado'}",
