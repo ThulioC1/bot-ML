@@ -442,6 +442,12 @@ def _ml_product_url(href):
     return url
 
 
+def store_nome(url):
+    """Extrai o nome da loja de uma URL /social/<loja>."""
+    m = re.search(r"mercadolivre\.com\.br/social/([^/?#]+)", url or "", re.I)
+    return m.group(1).strip("/").lower() if m else (url or "?")
+
+
 def store_catalog(store_url):
     """Le o catalogo da loja (/social/user) e devolve [{title, price, url, image}]."""
     if not store_url:
@@ -473,11 +479,13 @@ def store_catalog(store_url):
                     image = (img.get("data-src") or img.get("data-zoom") or img.get("src") or "")
                 if title and price:
                     items.append({"title": title, "price": price,
-                                  "url": product_url, "image": image})
+                                  "url": product_url, "image": image,
+                                  "loja": store_nome(store_url)})
             except Exception:
                 continue
     URL_CACHE[cache_key] = (time.time(), items)
-    log(f"📦 Catálogo da loja: {len(items)} produto(s)")
+    nome = store_nome(store_url)
+    log(f"📦 Catálogo da loja {nome}: {len(items)} produto(s)")
     return items
 
 
@@ -1987,6 +1995,7 @@ HELP = (
     "/canal — publica o último link que você enviou\n"
     "/preco <valor> <link> — monta o post com preço manual\n"
     "/buscar <termo> — busca ofertas do termo\n"
+    "/lojas — quais lojas do ML o bot está usando\n"
     "/status — diagnóstico das fontes\n"
     "/ajuda — esta ajuda"
 )
@@ -2027,6 +2036,28 @@ def handle_private_message(message):
             f"• Canal: {get_chat_name(TELEGRAM_CHAT_ID)}",
         ]
         send_message("\n".join(lines), chat_id=chat_id, reply_to=message_id)
+        return
+
+    if text.startswith("/lojas"):
+        aprendidas = load_json(STORES_FILE, [])
+        linhas = ["🏬 *Lojas do Mercado Livre em uso*", ""]
+        if not ML_STORES and not aprendidas:
+            linhas.append("Nenhuma loja configurada.")
+            linhas.append("Defina `ML_STORES=seuloja` no .env, ou mande um link")
+            linhas.append("de loja no canal que o bot aprende sozinho.")
+        else:
+            todas = list(ML_STORES) + [s for s in aprendidas if s not in ML_STORES]
+            for loja in todas:
+                origem = "✅ sua (do .env)" if loja in ML_STORES else "🔎 aprendida no canal"
+                itens = store_catalog(ML_STORE_BASE + loja)
+                dentro = [i for i in itens if oferta_valida(i)[0]]
+                linhas.append(f"• /social/{loja}  — {origem}")
+                linhas.append(f"   {len(itens)} produto(s) na vitrine, "
+                              f"{len(dentro)} passam no filtro")
+                amostra = ", ".join(p["title"][:22] for p in itens[:2])
+                if amostra:
+                    linhas.append(f"   ex.: {amostra}")
+        send_message("\n".join(linhas), chat_id=chat_id, reply_to=message_id)
         return
 
     if text.startswith("/buscar"):
