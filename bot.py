@@ -728,7 +728,10 @@ def send_message(text, chat_id=None, photo_url=None, reply_to=None, reply_markup
         if reply_to:
             payload["reply_to_message_id"] = reply_to
         if reply_markup:
-            payload["reply_markup"] = reply_markup
+            # TEM de ir como string JSON. No envio com arquivo o requests usa
+            # multipart (data=) e um dict aninhado viraria texto com aspas
+            # simples -> Telegram responde 400 e recusa a FOTO.
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
 
         local = download_image(photo_url)
         if local:
@@ -750,7 +753,7 @@ def send_message(text, chat_id=None, photo_url=None, reply_to=None, reply_markup
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     if reply_markup:
-        payload["reply_markup"] = reply_markup
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     return bool(tg_api("sendMessage", payload))
 
 
@@ -1118,6 +1121,52 @@ def arte_para_publicar(image_url, preco, preco_original=None, desconto=None, tit
 # --------------------------------------------------------------------------
 # Formatação
 # --------------------------------------------------------------------------
+
+_MONEY_RE = re.compile(
+    r"R\$\s*(\d{1,3}(?:\.\d{3})+(?:,\d{2})?|\d+(?:,\d{2})?|\d+)", re.I
+)
+
+
+def prices_from_text(text):
+    """Le o preco atual e o preco "de R$ X" de um texto de oferta.
+
+    Devolve (atual, antigo). O texto dos canais e livre: vem "R$ 1.234,00"
+    e tambem "De R$ 191 por R$ 110 no Pix". O regex antigo exigia centavos
+    (\\d{2}), entao "R$ 110" nao era reconhecido e o preco antigo nunca
+    aparecia.
+    """
+    if not text:
+        return None, None
+    limpo = re.sub(r"https?://\S+", " ", text)      # link nao e preco
+    limpo = re.sub(r"\d{1,2}/\d{1,2}", " ", limpo)  # data tipo 10/10 tambem nao
+
+    valores = []
+    for m in _MONEY_RE.finditer(limpo):
+        v = parse_money(m.group(1))
+        if v and v > 0:
+            valores.append(v)
+
+    atual = antigo = None
+    m_por = re.search(r"por\s*R\$\s*(\d[\d.,]*)", limpo, re.I)
+    m_de = re.search(r"\bde\s*R\$\s*(\d[\d.,]*)", limpo, re.I)
+    if m_por:
+        atual = parse_money(m_por.group(1))
+    elif valores:
+        atual = valores[0]
+    if m_de:
+        antigo = parse_money(m_de.group(1))
+    if antigo is None and len(valores) > 1:
+        maior = max(valores)
+        if atual and maior > atual:
+            antigo = maior
+
+    # so vale como preco antigo se for MAIOR que o atual
+    if atual and antigo and antigo <= atual:
+        antigo = None
+    if not atual and antigo:
+        atual, antigo = antigo, None
+    return atual, antigo
+
 
 def price_block(preco, preco_original):
     if preco_original and preco and preco_original > preco:
@@ -1952,13 +2001,13 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
         lines += block.split("\n") + [""]
     if aviso:
         lines += [aviso, ""]
-    lines += [f"🛒 Link: {link}"]
-
-    # Cria botão inline com o link afiliado
+    # A URL nao vai no texto: fica so no botao, que e o que o usuario pediu
+    # (link gigante em texto deixa o post feio).
     keyboard = {
         "inline_keyboard": [[{"text": "💗 Ver Oferta", "url": link}]]
     }
-    lines += ["", ""]
+    if chat_id is None:
+        lines += [FOOTER_TEXT]
     text = "\n".join(lines)
 
     ok = send_message(text, chat_id=chat_id, photo_url=product.get("thumbnail") or None, reply_to=reply_to, reply_markup=keyboard)
@@ -2268,10 +2317,9 @@ def channel_listener():
                 return
             link_aviso = ""
 
-            # 1. Preco e titulo sao lidos ANTES de montar os links: o link de
-            # loja so vira link de produto se a busca souber o que procurar.
-            match = re.search(r"R\$\s*([\d\.]+,\d{2})", raw)
-            price = parse_money(match.group(1)) if match else None
+            # 1. Preco (atual e o "de") sao lidos ANTES de montar os links: o link
+            # de loja so vira link de produto se a busca souber o que procurar.
+            price, old_price = prices_from_text(raw)
             _lines = [l.strip() for l in raw.split("\n") if l.strip()]
             title_guess = ""
             for l in _lines:
@@ -2286,9 +2334,6 @@ def channel_listener():
                 affiliate_urls[u] = tagged
                 if av and u.rstrip(".,)") == product_urls[0].rstrip(".,)"):
                     link_aviso = av
-            text = raw
-            for original, tagged in affiliate_urls.items():
-                text = text.replace(original, tagged)
             link = affiliate_urls[product_urls[0].rstrip(".,)")]
 
             # 3. Foto: usa a do post, senao extrai da pagina do produto
@@ -2308,35 +2353,36 @@ def channel_listener():
                 title = data.get("title") or ""
                 image = image or (data.get("image") or "")
                 price = price or data.get("price")
+                old_price = old_price or data.get("original_price")
 
             if not title:
                 title = title_guess or (_lines[0][:150] if _lines else "Oferta")
 
-            # 4. Monta o post com o preco quando ele nao veio no texto original
-            if price and not match:
-                text = f"{title}\n\n{price_block(price, None)}\n\n{text}"
-
-            log(f"📡 Canal: {title[:45]} | foto={'sim' if image else 'nao'} | preco={brl(price)}")
+            log(f"📡 Canal: {title[:45]} | foto={'sim' if image else 'nao'} "
+                f"| preco={brl(price)} | de={brl(old_price)}")
             if link_aviso:
                 log(f"⚠️ {link_aviso}")
                 notify_admin(f"⚠️ Oferta do canal ignorada por comissao: "
                              f"{link_aviso}\n{title[:70]}")
                 return
-            # 5. Monta o post com preço e link como botão inline
-            price_display = price_block(price, None)
-            lines = [f"🔥 OFERTA", "", f"📦 {title}", ""]
-            if price_display:
-                lines += price_display.split("\n") + [""]
-            lines += [f"🛒 Link: {link}"]
-            # Cria teclado inline
+
+            # 4. Post montado do zero: titulo + preco antigo + preco atual.
+            #    NAO repostamos o texto do canal (era ele que trazia o titulo
+            #    pela segunda vez, a frase de marketing e o link gigante), e
+            #    NAO imprimimos a URL — ela vai so no botao, que e o que o
+            #    usuario pediu: link embutido, sem aquela parede de texto.
+            lines = ["🔥 OFERTA EM DESTAQUE", "", f"📦 {title}", ""]
+            block = price_block(price, old_price)
+            if block:
+                lines += block.split("\n") + [""]
+            lines += [FOOTER_TEXT]
+            text = "\n".join(lines)
             keyboard = {
                 "inline_keyboard": [[{"text": "💗 Ver Oferta", "url": link}]]
             }
-            lines += ["", ""]
-            text = "\n".join(lines) + f"\n\n{FOOTER_TEXT}"
             send_message(text, photo_url=image, reply_markup=keyboard)
             save_to_vitrine({"id": "ch_" + hashlib.md5(link.encode()).hexdigest()[:10],
-                             "title": title, "price": price, "original_price": product.get("original_price"),
+                             "title": title, "price": price, "original_price": old_price,
                              "link": link, "image": image or ""})
 
         log(f"👂 Telethon conectado: {', '.join(SOURCE_CHANNELS)}")

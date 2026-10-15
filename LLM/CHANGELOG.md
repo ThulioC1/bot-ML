@@ -5,7 +5,155 @@
 
 ---
 
-## [2026-10-15 12:30] — Sessão 22: link como botão no Telegram, título sem duplicata, footer corrigido
+## [2026-10-15 15:10] — Sessão 23: as fotos pararam de funcionar (era o botão) + preço antigo
+
+**Objetivo:** o usuário reclamou que *"após essas últimas mudanças o Telegram
+parou de aceitar as fotos"*, e pediu o **preço antigo** visível no post
+(*"de 60 por 💰 R$ 49,90"*). A foto `E:\Pasta de erro\2 (2).jpeg`
+(15/10 14:31) mostrou o post antigo quebrado.
+
+### 🔴 CAUSA RAIZ DAS FOTOS PARANDO DE FUNCIONAR
+
+Eu introduzi o `reply_markup` (botão) e **esqueci que ele muda de formato de
+envio**:
+
+```python
+def tg_api(method, payload=None, files=None, timeout=60):
+    if files:
+        resp = requests.post(url, data=payload, files=files)   # multipart
+    else:
+        resp = requests.post(url, json=payload)               # JSON
+```
+
+No caminho **com arquivo** o `requests` usa `data=` e **stringifica** o valor:
+`str({'inline_keyboard': ...})` sai com **aspas simples**, que não é JSON.
+O Telegram responde `400 Bad Request: can't parse reply keyboard markup` e
+**recusa a foto**.
+
+No caminho **sem arquivo** (`sendMessage`) o `requests` usa `json=` e o dict
+vira JSON válido — **funcionava**.
+
+> É por isso que **só as fotos quebraram** e o texto continuava saindo:
+> o `sendPhoto` falhava e caía no fallback `sendMessage`.
+
+**Prova** (executada nesta sessão, `requests` real):
+
+```
+dict cru   : ERRO -> Telegram rejeita (JSONDecodeError)
+json.dumps : OK  -> Telegram aceita
+```
+
+**Correção:** `json.dumps(reply_markup, ensure_ascii=False)` nos dois caminhos
+de `send_message()`.
+
+### 🔴 SEGUNDO BUG: `NameError` matava o handler
+
+Eu tinha escrito `product.get("original_price")` dentro do `handler` do
+Telethon — mas **não existe variável `product` ali**. `NameError` derrubava o
+handler inteiro, ou seja, **nada era publicado**. Trocado por `old_price`.
+
+### 🔴 TERCEIRO BUG: o título duplicado era o texto cru
+
+O handler fazia `text = raw` e reenviava a mensagem **inteira** do canal,
+depois de acrescentar o título no topo. Era por isso que o título aparecia
+**duas vezes**, e junto vinham a frase de marketing e o link gigante.
+
+**Correção:** o post agora é montado do zero — título, preço e nada mais.
+
+### 🔴 QUARTO BUG: o preço antigo nunca era lido do texto
+
+O regex era `r"R\$\s*([\d\.]+,\d{2})"` — **exigia centavos**. O canal escreve
+`De R$ 191 por R$ 110` (sem centavos), então:
+- o preço atual caía no `extract_product` (110,19 da página da Amazon);
+- o preço antigo **nunca** era lido.
+
+Novo `prices_from_text()` devolve `(atual, antigo)` e entende:
+`"De R$ X por R$ Y"`, `"R$ 1.234,56"`, `"R$ 110"`, `"R$ 1.234"`.
+
+### ✅ Testado — 11/11
+
+| Caso | Esperado | Ok |
+|---|---|---|
+| **texto exato da foto** (`De R$ 191 por R$ 110`) | 110,00 / 191,00 | ✅ |
+| só atual com centavos (`R$ 209,90`) | 209,90 | ✅ |
+| só atual sem centavos (`R$ 110`) | 110,00 | ✅ |
+| milhar com ponto (`R$ 1.234,56`) | 1234,56 | ✅ |
+| milhar sem centavos (`R$ 1.234`) | 1234,00 | ✅ |
+| `De R$ 96,00 por R$ 46,90` | 46,90 / 96,00 | ✅ |
+| `De R$ 20 por R$ 50` (antigo menor) | 50,00, sem antigo | ✅ |
+| preços soltos (`R$ 89,90 / R$ 199,90`) | 89,90 / 199,90 | ✅ |
+| número dentro do link | não conta como preço | ✅ |
+| sem preço nenhum | `(None, None)` | ✅ |
+
+### Antes → depois (caso da foto)
+
+**Antes:**
+```
+Mixer Power Inox 3 em 1 600W Elgin Lunar 110V
+💰 R$ 110,19
+MIXER É AVANÇO DE VIDA
+Mixer Power Inox 3 em 1 600W Elgin 110V      <-- título DE NOVO
+De R$ 191 por R$ 110 no Pix
+https://www.amazon.com.br/gp/product/B0DCKBMVH9?linkCode=sl2&linkld=
+5853e120ee6bf9054a3b7c9b15123ea9&ref_=...   <-- link GIGANTE
+ðŸ"— Links afiliados...                       <-- emoji quebrado (mojibake)
+```
+*(sem botão, e a foto nem entrava)*
+
+**Depois:** 182 caracteres, título único, com preço antigo e botão:
+```
+🔥 OFERTA EM DESTAQUE
+
+📦 Mixer Power Inox 3 em 1 600W Elgin Lunar 110V
+
+📉 De R$ 191,00
+🔥 Por R$ 110,00            (42% de desconto)
+
+Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo
+
+        [ 💗 Ver Oferta ]   <-- botão, URL não aparece no texto
+```
+
+### 🗑️ `FOOTER_TEXT` — o emoji quebrado era mojibake
+
+Na foto aparece `ðŸ"— Links afiliados`. Isso é o 🔗 **decodificado como
+cp1252**: o texto antigo tinha o emoji e o console/conteúdo gravou errado.
+O `FOOTER_TEXT` novo **não tem emoji nenhum**, então não há o que quebrar:
+```python
+FOOTER_TEXT = env("FOOTER", "Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo")
+```
+
+### Arquivos alterados
+- `bot.py` — `send_message()` (json.dumps), `prices_from_text()` (novo),
+  `_MONEY_RE` (novo), handler do Telethon, `publish()`, `FOOTER_TEXT`
+- `LLM/CHANGELOG.md`, `LLM/ISSUES.md`, `LLM/PROJECT_STATE.md` — esta sessão
+- `LLM/README.md` — reforçada a regra de registrar **toda** alteração
+
+### ⚠️ Lição (erro meu, não repetir)
+
+> Ao passar um **dict aninhado** para a API do Telegram, **sempre** use
+> `json.dumps()`. O `requests` muda o formato de serialização conforme você
+> usa `data=` ou `json=`, e o `data=` (multipart) não entende dict aninhado.
+>
+> E: **teste o caminho com arquivo**, não só o caminho com JSON. O botão
+> funcionou no teste de texto e só falhou em produção, nas fotos.
+
+**Resultado:**
+- ✅ Fotos voltam a ser aceitas (`reply_markup` serializado)
+- ✅ `NameError` do handler eliminado
+- ✅ Título não duplica mais (texto cru não é repostado)
+- ✅ Preço antigo aparece: `De R$ 191` → `Por R$ 110`
+- ✅ Link gigante saiu do texto, ficou só no botão
+- ✅ Emoji quebrado eliminado
+
+---
+
+## [2026-10-15 12:30] — Sessão 22: link como botão, título, footer (VERSÃO SUPERADA pela 23)
+
+> ⚠️ **Esta sessão foi corrigida na Sessão 23.** O botão foi implementado, mas
+> quebrou o envio de fotos (`reply_markup` sem `json.dumps`) e o `NameError`
+> de `product` impedia a publicação. O preço antigo não funcionava porque o
+> regex exigia centavos. **Leia a Sessão 23 antes de mexer nessa parte.**
 
 **Objetivo:** melhorar a apresentação das mensagens no Telegram - link como botão inline, título único e footer de afiliado corrigido.
 
@@ -22,16 +170,14 @@
 | Preço antigo | Já era exibido via `price_block()` | Mantido (De R$ X → Por R$ Y) |
 
 **Resultado:**
-- ✅ Link agora é botão clicável no Telegram
-- ✅ Título não se duplica mais
+- ⚠️ Link agora é botão clicável no Telegram — **mas quebrou as fotos**
+- ⚠️ Título não se duplica mais — **mas o texto cru continuava sendo repostado**
 - ✅ Footer de afiliado limpo e sem emoji quebrado
-- ✅ Preço antigo continua aparecendo quando houver desconto
-
-### `LLM/CHANGELOG.md` — esta entrada
-### `LLM/PROJECT_STATE.md` — sem alterações necessárias
-### `LLM/ISSUES.md` — Issues resolvidas nesta sessão
+- ❌ Preço antigo **não** aparecia (regex exigia centavos) — corrigido na 23
 
 ---
+
+## [2026-10-15 08:15] — Sessão 21: filtro de oferta (shampoo de 24k passou)
 
 **Objetivo:** o usuário pediu ponderação de valores para só entrar promoção de
 verdade — *"Ontem veio um Shampoo de 24k"*.
@@ -785,7 +931,7 @@ E ter `termux-wake-lock` ativo, porque o Chromium é pesado.
 
 ## [2026-10-14 15:45] — Sessão 12: `/ofertas` volta a funcionar com Chrome real (Selenium)
 
-**Objetivo:** o usuárioukes Year質問ou: *"Não tem como o bot fazer scrap
+**Objetivo:** o usuário perguntou: *"Não tem como o bot fazer scrap
 nessa pagina não? Eu tinha uma versão dele que sorteava uma das paginas
 dessa sessão do mercado livre e trazia os produtos normalmente."*
 

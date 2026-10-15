@@ -19,10 +19,21 @@
 
 ## Protocolo de trabalho (obrigatório para toda IA)
 
+> **REGRA INEGOCIÁVEL: nenhuma alteração de código sai desta sessão sem estar
+> registrada no `CHANGELOG.md`.** Isso inclui correções "rápidas", ajustes de
+> uma linha e mudanças que você testou e **reverteu**. Se você mexeu no
+> `bot.py`, tem uma entrada nova no topo do changelog. Sem exceção.
+>
+> Na dúvida se vale registrar: **vale**. Custa 10 segundos; omitir custa uma
+> sessão inteira de investigação para a próxima IA.
+
 **AO INICIAR uma sessão:**
 1. Ler `PROJECT_STATE.md` e `ISSUES.md`.
 2. Ler as últimas entradas do `CHANGELOG.md`.
 3. Não repetir trabalho já feito. Não "descobrir" bugs já documentados.
+   - Se uma entrada anterior disser que algo **não** funciona, desconfie do
+     código e **confirme lendo** — às vezes a IA anterior concluiu errado
+     (já aconteceu nas sessões 11 e 22).
 
 **DURANTE a sessão:**
 - Toda alteração de código, decisão de arquitetura, bug encontrado ou hipótese
@@ -30,6 +41,9 @@
 - Bugs / tarefas em aberto entram em `ISSUES.md`.
 - Se a alteração mudou o Understanding do projeto (estrutura, fluxo, decisões),
   atualizar `PROJECT_STATE.md`.
+- **Teste de verdade, não só "parece certo".** Se você não rodou, diga que não
+  rodou. A Sessão 22 registrava um botão como "funcionando" sem ter testado o
+  caminho com **foto** — e foi exatamente esse caminho que quebrou em produção.
 
 **AO ENCERRAR uma sessão:**
 - Escrever no `CHANGELOG.md` o que foi FEITO e o que NÃO foi concluído.

@@ -1,9 +1,11 @@
 # Estado do Projeto
 
-> Última atualização: 2026-10-14 (sessão 3 — `bot.py` recuperado)
+> Última atualização: **2026-10-15 (sessão 23 — botão + preço antigo)**
+
 ## ✅ O código principal voltou
 
-`bot.py` está na pasta: **1.261 linhas / 58.847 bytes / 47 funções.**
+`bot.py` está na pasta: **~1.290 linhas / 50+ funções** (-era 1.261 / 47 na
+sessão 14; cresceu com as sessões 21–23).
 
 Já tem backup em `bot.py.backup`.
 
@@ -16,18 +18,42 @@ documentada:
 → **`RECOVERY_bot_py_from_pyc.txt`** — disassembly bruto (636 KB)
 → `bot.py.pyc-backup` — cópia do bytecode fora do `__pycache__`
 
-## 🆕 Sessão 22 — Interface do Telegram melhorada (15/10)
+## 🆕 Sessão 23 — Como o Telegram publica hoje (15/10)
 
-**O que mudou:**
-- Link de afiliado agora aparece como botão inline `💗 Ver Oferta` no Telegram
-- Título da oferta definido apenas uma vez (sem duplicata)
-- Texto "afiliado" no footer corrigido (removido emoji quebrado)
-- Formato `De R$ X → Por R$ Y` para preços com desconto continua funcionando
+**Post do canal (Telethon) e post do ciclo — mesmo formato:**
 
-**Arquivos alterados:**
-- `bot.py` — `send_message()` agora aceita `reply_markup`; canal handler usa teclado inline; `FOOTER_TEXT` atualizado; título com `if not title:` guard
+```
+🔥 OFERTA EM DESTAQUE
 
-⚠️ **Versão mais antiga nunca foi salva em disco.** Só existe como bytecode.
+📦 <título>
+
+📉 De R$ 191,00
+🔥 Por R$ 110,00
+
+Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo
+
+      [ 💗 Ver Oferta ]        ← inline keyboard com o link de afiliado
+```
+
+**Regras que valem:**
+- A **URL não aparece no texto** — só no botão.
+- O post é **montado do zero**: o texto cru do canal **não** é repostado
+  (era o que duplicava o título).
+- Preço antigo e atual são lidos do **texto do canal** (`prices_from_text`),
+  com fallback para a página do produto.
+
+### ⚠️ Armadilha conhecida — não repetir
+
+`tg_api()` muda a forma de serialização:
+
+| caminho | chamada do `requests` | dict aninhado |
+|---|---|---|
+| com arquivo (`sendPhoto`) | `data=payload` (multipart) | ❌ vira `str(dict)` com **aspas simples** → Telegram 400 |
+| sem arquivo (`sendMessage`) | `json=payload` | ✅ JSON válido |
+
+→ **Sempre `json.dumps()` em `reply_markup`**, e **teste o caminho com foto**.
+
+**Funções novas desta sessão:** `prices_from_text()` e a constante `_MONEY_RE`.
 
 ## O que é
 

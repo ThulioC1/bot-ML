@@ -5,6 +5,47 @@
 
 ---
 
+## [RESOLVIDA · 2026-10-15] Botão do Telegram quebrou o envio de fotos
+
+**Sintoma:** depois da Sessão 22, o Telegram parou de aceitar as fotos. O texto
+continuava saindo (sem botão), a foto não.
+
+**Causa:** `tg_api()` usa `data=payload` quando há arquivo (multipart) e
+`json=payload` quando não há. Com `data=`, o `requests` **stringifica** o
+`reply_markup` e um dict aninhado sai com **aspas simples** — o Telegram
+responde `400 can't parse reply keyboard markup`.
+
+**Correção:** `json.dumps(reply_markup, ensure_ascii=False)` nos dois caminhos
+de `send_message()`. Provado: `str(dict)` → `JSONDecodeError`; `json.dumps` → OK.
+
+> **Regra:** dict aninhado para a API do Telegram **sempre** via `json.dumps()`.
+> E testar o caminho **com arquivo**, não só o com JSON.
+
+## [RESOLVIDA · 2026-10-15] Título duplicado nos posts do canal
+
+**Causa:** o handler fazia `text = raw` e reenviava a mensagem inteira do canal
+depois de acrescentar o título no topo. O título saía duas vezes, e junto iam a
+frase de marketing e o link gigante.
+
+**Correção:** o post é montado do zero — título, preço e footer. O texto do
+canal não é repostado.
+
+## [RESOLVIDA · 2026-10-15] Preço antigo nunca aparecia no Telegram
+
+**Causa:** o regex `r"R\$\s*([\d\.]+,\d{2})"` **exigia centavos**. Os canais
+publicam `De R$ 191 por R$ 110` (sem centavos) → o preço atual vinha do
+`extract_product` e o antigo nunca era lido.
+
+**Correção:** `prices_from_text()` devolve `(atual, antigo)` e entende
+`"De R$ X por R$ Y"`, `"R$ 1.234,56"`, `"R$ 110"`, `"R$ 1.234"`. 11/11 testes.
+
+## [RESOLVIDA · 2026-10-15] Emoji `🔗` saía como `ðŸ"`
+
+Era **mojibake**: o emoji decodificado como cp1252. O `FOOTER_TEXT` novo não tem
+emoji nenhum, então não há o que quebrar.
+
+---
+
 ## [PARCIAL · 2026-10-14] `bot.py` foi apagado do disco
 
 **Status mudou:** o usuário recuperou o fonte, **mas uma versão mais antiga.**
