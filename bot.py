@@ -110,7 +110,13 @@ LINK_GEN_CACHE_TTL = 6 * 3600
 
 ML_LINKBUILDER_URL = "https://www.mercadolivre.com.br/afiliados/linkbuilder"
 SHOPEE_AFFILIATE_URL = "https://affiliate.shopee.com.br/"
+SHOPEE_PRODUCT_OFFER_URL = "https://affiliate.shopee.com.br/offer/product_offer"
+SHOPEE_CUSTOM_LINK_URL = "https://affiliate.shopee.com.br/offer/custom_link"
 AMAZON_HOME_URL = "https://www.amazon.com.br/"
+try:
+    SHOPEE_OFFER_LIMIT = max(1, int(env("SHOPEE_OFFER_LIMIT", "6") or 6))
+except ValueError:
+    SHOPEE_OFFER_LIMIT = 6
 GENERATOR_STATE = {
     "ml": {"ok": None, "msg": "não usado ainda"},
     "shopee": {"ok": None, "msg": "não usado ainda"},
@@ -869,6 +875,129 @@ def generate_shopee_affiliate_link(url):
     return None, f"Shopee: {msg}"
 
 
+def generate_shopee_portal_link(url):
+    """Gera o link no portal logado da Shopee; Open API entra como reserva."""
+    if not BROWSER_SCRAPING:
+        return generate_shopee_affiliate_link(url)
+    url = _normalize_affiliate_url(url, "shopee")
+    short_error = _short_input_error("shopee", url)
+    if short_error:
+        return short_error
+
+    script = r"""
+    const target = __TARGET__;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const text = (el) => norm(el && (el.innerText || el.textContent || ""));
+    const visible = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+    };
+    const setValue = (el, value) => {
+      const proto = el.tagName === "TEXTAREA"
+        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+      setter.call(el, value);
+      el.dispatchEvent(new Event("input", {bubbles: true}));
+      el.dispatchEvent(new Event("change", {bubbles: true}));
+    };
+    const readLink = (root) => {
+      if (!root) return "";
+      for (const node of root.querySelectorAll("textarea, input")) {
+        for (const part of String(node.value || "").split(/\s+/)) {
+          if (/^https?:\/\/(?:shope\.ee|s\.shopee\.com\.br)\//i.test(part)) {
+            return part.replace(/[.,);]+$/, "");
+          }
+        }
+      }
+      const m = text(root).match(
+        /https?:\/\/(?:shope\.ee|s\.shopee\.com\.br)\/[^\s"'<>]+/i);
+      return m ? m[0].replace(/[.,);]+$/, "") : "";
+    };
+    const api = async () => {
+      try {
+        const resp = await fetch("/api/v3/gql?q=batchCustomLink", {
+          method: "POST",
+          credentials: "include",
+          headers: {"Content-Type": "application/json", "Accept": "application/json"},
+          body: JSON.stringify({
+            operationName: "batchGetCustomLink",
+            query: "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }",
+            variables: {
+              linkParams: [{originalLink: target, advancedLinkParams: null}],
+              sourceCaller: "CUSTOM_LINK_CALLER"
+            }
+          })
+        });
+        const data = await resp.json();
+        const item = ((data.data || {}).batchCustomLink || [])[0] || {};
+        return item.shortLink || item.longLink || "";
+      } catch (e) {
+        return "";
+      }
+    };
+
+    if (/\/auth(?:\/|$)/.test(location.pathname)) {
+      return {ok: false, error: "login necessário em " + location.href,
+              url: location.href, preview: text(document.body).slice(0, 400)};
+    }
+
+    let ta = null;
+    for (let i = 0; i < 24 && !ta; i++) {
+      ta = document.querySelector(".custom-textarea textarea, textarea");
+      if (!ta) await sleep(500);
+    }
+    if (ta) {
+      ta.focus();
+      setValue(ta, target);
+      await sleep(400);
+      const submit = Array.from(
+        document.querySelectorAll('button[type="submit"], button, [role="button"]')
+      ).find((b) => visible(b) && /^obter link$/i.test(text(b)));
+      if (submit) {
+        submit.click();
+        for (let i = 0; i < 40; i++) {
+          await sleep(500);
+          const modal = Array.from(
+            document.querySelectorAll(".success-modal, .ant-modal-content")
+          ).find(visible);
+          if (modal) {
+            const link = readLink(modal);
+            if (link) return {ok: true, link: link, source: "portal"};
+          }
+        }
+      }
+    }
+
+    const link = await api();
+    if (link) return {ok: true, link: link, source: "api"};
+    return {ok: false, error: "portal não devolveu link (login?)",
+            url: location.href, preview: text(document.body).slice(0, 400)};
+    """
+    script = script.replace("__TARGET__", json.dumps(url, ensure_ascii=False))
+    result = browser_eval(SHOPEE_CUSTOM_LINK_URL, script, wait=8,
+                          timeout=max(120, LINK_GEN_TIMEOUT + 60))
+    value = (result or {}).get("value") or {}
+    link = value.get("link") if isinstance(value, dict) else ""
+    if link:
+        _set_generator_state("shopee", True, f"link gerado para {url[:60]}")
+        return link, None
+
+    detail = ""
+    if isinstance(value, dict):
+        detail = value.get("error") or value.get("preview") or ""
+    if not detail:
+        detail = (result or {}).get("error") or "navegador indisponível"
+    portal_error = f"Shopee portal: {str(detail)[:200]}"
+    fallback, api_error = generate_shopee_affiliate_link(url)
+    if fallback:
+        return fallback, None
+    _set_generator_state("shopee", False, portal_error)
+    return None, f"{portal_error}; {api_error or 'Open API indisponível'}"
+
+
 def _amazon_asin(url):
     match = AMAZON_ASIN_RE.search(url or "")
     if match:
@@ -999,11 +1128,14 @@ def generate_affiliate_link(url, price=None, title=None):
         return None, "URL vazia"
     url = url.rstrip(".,)")
     store = _store_of_url(url)
+    if store:
+        url = expand_url(url)
+        store = _store_of_url(url)
 
     if store == "ml":
         generator = generate_ml_affiliate_link
     elif store == "shopee":
-        generator = generate_shopee_affiliate_link
+        generator = generate_shopee_portal_link
     elif store == "amazon":
         generator = generate_amazon_affiliate_link
     else:
@@ -1880,13 +2012,17 @@ def selenium_eval(url, script, wait=3, timeout=None, await_promise=True):
                     "(async () => {"
                     "  try {"
                     "    const value = await (async () => {" + script + "})();"
-                    "    done({ok: true, value: value});"
-                    "  } catch (e) { done({ok: false, error: String(e)}); }"
+                    "    done({__selenium_eval__: true, ok: true, value: value});"
+                    "  } catch (e) {"
+                    "    done({__selenium_eval__: true, ok: false, error: String(e)});"
+                    "  }"
                     "})();"
                 )
                 raw = driver.execute_async_script(wrapper)
             else:
                 raw = driver.execute_script(script)
+            if isinstance(raw, dict) and raw.pop("__selenium_eval__", None):
+                return raw
             return {"ok": True, "value": raw}
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -2377,7 +2513,178 @@ def _shopee_search_data(keyword):
     return None
 
 
+def fetch_shopee_affiliate_products(search_query=None):
+    """Le as ofertas do portal logado e copia o link de cada modal."""
+    if not BROWSER_SCRAPING:
+        return []
+    script = r"""
+    const LIMIT = __LIMIT__;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const text = (el) => norm(el && (el.innerText || el.textContent || ""));
+    const visible = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+    };
+    const readLink = (root) => {
+      if (!root) return "";
+      for (const node of root.querySelectorAll("textarea, input")) {
+        for (const part of String(node.value || "").split(/\s+/)) {
+          if (/^https?:\/\/(?:shope\.ee|s\.shopee\.com\.br)\//i.test(part)) {
+            return part.replace(/[.,);]+$/, "");
+          }
+        }
+      }
+      const m = text(root).match(
+        /https?:\/\/(?:shope\.ee|s\.shopee\.com\.br)\/[^\s"'<>]+/i);
+      return m ? m[0].replace(/[.,);]+$/, "") : "";
+    };
+    const cardOf = (btn) => {
+      const card = btn.closest("a") || btn.parentElement;
+      if (card && card.querySelector(".product-name")) return card;
+      let node = btn.parentElement;
+      for (let i = 0; i < 8 && node; i++) {
+        if (node.querySelector(".product-name")
+            && node.querySelectorAll(".get-link-btn").length === 1) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      return card;
+    };
+    const imageOf = (card) => {
+      const img = card && card.querySelector(".img-warpper img, img");
+      return img ? (img.currentSrc || img.src || img.getAttribute("data-src") || "") : "";
+    };
+    const priceOf = (card) => {
+      const el = card && card.querySelector(".product-price");
+      return el ? text(el) : "";
+    };
+    const offerOf = (btn, card) => {
+      const box = btn.closest('[id^="product_offer_"]');
+      if (box && box.id) return box.id.replace("product_offer_", "");
+      const input = card && card.querySelector('input[type="checkbox"]');
+      return input ? String(input.value || "") : "";
+    };
+
+    let buttons = [];
+    for (let i = 0; i < 40 && !buttons.length; i++) {
+      buttons = Array.from(document.querySelectorAll(".get-link-btn"))
+        .filter((b) => visible(b) && !b.disabled
+                && !/massa|lote|batch/i.test(text(b)));
+      if (!buttons.length) await sleep(500);
+    }
+    if (!buttons.length) {
+      return {
+        ok: false,
+        error: /\/auth(?:\/|$)/.test(location.pathname)
+          ? "login necessário" : "nenhum botão .get-link-btn na página",
+        url: location.href,
+        title: document.title,
+        preview: text(document.body).slice(0, 500)
+      };
+    }
+
+    const products = [];
+    for (const btn of buttons.slice(0, LIMIT)) {
+      const card = cardOf(btn);
+      const item = {
+        ok: false,
+        title: text(card && card.querySelector(".product-name")),
+        price: priceOf(card),
+        image: imageOf(card),
+        offer_id: offerOf(btn, card),
+        affiliate_link: "",
+        error: ""
+      };
+      try {
+        btn.scrollIntoView({block: "center"});
+        btn.click();
+        let modal = null;
+        let link = "";
+        for (let i = 0; i < 50 && !link; i++) {
+          await sleep(300);
+          modal = document.querySelector(".get-link-modal");
+          if (visible(modal)) link = readLink(modal);
+        }
+        if (!link && modal) {
+          const longTab = Array.from(
+            modal.querySelectorAll('[role="tab"], .ant-tabs-tab, button')
+          ).find((el) => /link longo|long link/i.test(text(el)));
+          if (longTab) {
+            longTab.click();
+            await sleep(700);
+            link = readLink(modal);
+          }
+        }
+        item.ok = !!link;
+        item.affiliate_link = link;
+        item.error = link ? "" : "modal sem link";
+      } catch (e) {
+        item.error = String(e);
+      }
+      products.push(item);
+      const modal = document.querySelector(".get-link-modal");
+      const close = modal && modal.querySelector(".ant-modal-close");
+      if (close) close.click();
+      else document.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Escape", keyCode: 27, which: 27, bubbles: true
+      }));
+      await sleep(500);
+    }
+    return {ok: true, products: products, url: location.href,
+            count: buttons.length, preview: text(document.body).slice(0, 300)};
+    """
+    script = script.replace("__LIMIT__", str(SHOPEE_OFFER_LIMIT))
+    result = browser_eval(SHOPEE_PRODUCT_OFFER_URL, script, wait=10,
+                          timeout=max(180, LINK_GEN_TIMEOUT * 3))
+    value = (result or {}).get("value") or {}
+    if not isinstance(value, dict) or not value.get("ok"):
+        detail = ""
+        if isinstance(value, dict):
+            detail = value.get("error") or value.get("preview") or ""
+        if not detail:
+            detail = (result or {}).get("error") or "navegador indisponível"
+        log(f"⚠️ Shopee portal: {str(detail)[:220]}")
+        return []
+
+    products = []
+    for item in value.get("products", []):
+        link = str(item.get("affiliate_link") or "").strip()
+        title = str(item.get("title") or "").strip()
+        price = parse_money(item.get("price"))
+        if not link or not title or not price:
+            if not link:
+                log(f"⚠️ Shopee oferta sem link: {title[:50] or item.get('offer_id')}")
+            continue
+        offer_id = str(item.get("offer_id") or "")
+        products.append({
+            "id": "shopee_" + (offer_id or hashlib.md5(link.encode()).hexdigest()[:12]),
+            "title": title[:180],
+            "price": price,
+            "original_price": None,
+            "permalink": link,
+            "affiliate_link": link,
+            "thumbnail": item.get("image") or "",
+            "source": "shopee_portal",
+        })
+
+    if search_query and products:
+        wanted = _keywords(search_query)
+        products = [p for p in products if _keywords(p["title"]) & wanted]
+    return products
+
+
 def fetch_shopee_products(search_query=None):
+    products = fetch_shopee_affiliate_products(search_query)
+    if products or not search_query:
+        if products:
+            random.shuffle(products)
+            log(f"✅ Shopee (portal): {len(products)} produto(s).")
+        return products
+
     products = []
     keyword = search_query or "ofertas"
     data = _shopee_search_data(keyword)
@@ -2679,7 +2986,10 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
     old = product.get("original_price")
     title = product.get("title") or "Oferta Especial"
     permalink = product.get("permalink") or product.get("link") or ""
-    link, aviso = generate_affiliate_link(permalink, price, title)
+    link = product.get("affiliate_link") or ""
+    aviso = ""
+    if not link:
+        link, aviso = generate_affiliate_link(permalink, price, title)
 
     if not link:
         notify_link_failure(permalink, title, aviso)

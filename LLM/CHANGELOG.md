@@ -5,6 +5,45 @@
 
 ---
 
+## [2026-10-19 10:55] — Sessão 26: Shopee pelo portal (produto → "Obter link") + link de loja do canal
+
+**Objetivo:** parar de raspar a busca pública da Shopee (403) e ler as ofertas
+direto do portal de afiliado logado (`/offer/product_offer`), publicando o link
+"Obter link" de cada card. Corrigir o canal, que recusava `meli.la` de loja
+porque a expansão acontecia depois da checagem de link de loja.
+
+**Arquivos alterados:**
+- `bot.py` — `SHOPEE_PRODUCT_OFFER_URL`, `SHOPEE_CUSTOM_LINK_URL` e
+  `SHOPEE_OFFER_LIMIT`; `generate_shopee_portal_link()`;
+  `fetch_shopee_affiliate_products()`; `fetch_shopee_products()` (portal
+  primeiro, busca antiga só para `/buscar`); `publish()` prefere
+  `product["affiliate_link"]`; `generate_affiliate_link()` expande o link antes
+  de decidir se é link de loja; `selenium_eval()` não embrulha duas vezes
+  `{ok, value}`.
+- `tests/test_affiliate.py` — 6 testes novos (portal scrape, portal generator,
+  fallback Open API, publish com link pronto, expansão antes do store link,
+  `selenium_eval` sem duplo embrulho).
+- `.env.example` — `SHOPEE_OFFER_LIMIT=6`.
+
+**Análise / o que foi observado:**
+- JS do portal: o modal `.get-link-modal` (módulo 55529) usa
+  `POST /api/v3/link/gen_by_item` no clique do card (props
+  `offer_id/shop_id/item_id/commission_id`, `type: item`); a página
+  `/offer/custom_link` usa GraphQL `batchCustomLink`
+  (`.custom-textarea textarea` → `.success-modal`).
+- Teste com HTML local + Chrome de verdade (fixture) achou bug real:
+  `selenium_eval` devolvia `{ok, value:{ok, value:{...}}}` e o scraping lia o
+  envelope, não os produtos; corrigido para não duplo-embrulhar.
+- Fixture validou os dois fluxos (2 cards lidos com os links certos; custom
+  link devolveu `https://shope.ee/custom789`) sem tocar o portal real.
+
+**Resultado:**
+- ✅ 28 testes passando.
+- ⚠️ Pendente: rodar `python bot.py --login-browser` e validar os seletores no
+  portal real (ver `ISSUES.md`).
+
+---
+
 ## [2026-10-19 09:25] — Sessão 25: link SEMPRE pelo gerador oficial + navegador persistente
 
 **Objetivo:** o usuário pediu trocar a montagem manual de `?tag`/`?matt_word`

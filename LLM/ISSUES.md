@@ -5,6 +5,24 @@
 
 ---
 
+## [ABERTA · 2026-10-19] Portal Shopee (product_offer) ainda não rodou AO VIVO
+
+O scraping do portal Shopee e o gerador de link do portal foram validados só
+com **fixture local** (Chrome real + HTML falso), não contra o portal logado.
+Sem `python bot.py --login-browser` não dá para garantir que:
+
+- o seletor `.get-link-btn` e o wrapper `product_offer_<offer_id>` continuam
+  iguais na página real;
+- a sessão do perfil (`.browser-profile`) está válida e o portal não redireciona
+  para `/auth`;
+- o modal `.get-link-modal` entrega o `standard_short_link` em um `TextArea`
+  (módulo 55529) dentro do loop de espera;
+- o `POST /api/v3/gql?q=batchCustomLink` de reserva passa pelos cookies/CSRF
+  reais do portal (e o `sourceCaller` segue `CUSTOM_LINK_CALLER`).
+
+**Como validar:** `python bot.py --login-browser` → subir o bot com
+`SHOPEE_OFFER_LIMIT=2` → conferir os posts e o `/status`.
+
 ## [ABERTA · 2026-10-19] Geradores oficiais nunca rodaram AO VIVO
 
 A Sessão 25 implementou `createLink` (ML), `generateShortLink` (Shopee) e

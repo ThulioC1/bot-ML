@@ -162,6 +162,21 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(link, url)
         self.assertIsNone(error)
 
+    def test_router_expands_before_store_detection(self):
+        short = "https://meli.la/2AbCdEf"
+        store = "https://www.mercadolivre.com.br/social/minhaloja"
+        resolved = "https://www.mercadolivre.com.br/produto/p/MLB123"
+        with mock.patch.object(bot, "expand_url", return_value=store), \
+                mock.patch.object(bot, "resolve_store_link",
+                                  return_value={"url": resolved}) as resolve, \
+                mock.patch.object(bot, "generate_ml_affiliate_link",
+                                  return_value=("https://meli.la/ok", None)) as gen:
+            link, error = bot.generate_affiliate_link(short, 10.0, "Produto")
+        self.assertEqual(link, "https://meli.la/ok")
+        self.assertIsNone(error)
+        resolve.assert_called_once()
+        gen.assert_called_once_with(resolved)
+
     def test_router_uses_cache(self):
         calls = []
 
@@ -177,6 +192,70 @@ class GeneratorTests(unittest.TestCase):
             second, _ = bot.generate_affiliate_link(url)
         self.assertEqual(first, second)
         self.assertEqual(len(calls), 1)
+
+
+class ShopeePortalTests(unittest.TestCase):
+    def test_portal_scrape_uses_modal_link(self):
+        value = {
+            "ok": True,
+            "products": [
+                {"ok": True, "title": "Fone Shopee", "price": "R$ 89,90",
+                 "image": "https://img/x.jpg", "offer_id": "999",
+                 "affiliate_link": "https://shope.ee/abc", "error": ""},
+                {"ok": False, "title": "Sem link", "price": "R$ 10,00",
+                 "image": "", "offer_id": "1", "affiliate_link": "",
+                 "error": "modal sem link"},
+            ],
+        }
+        with mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+                mock.patch.object(bot, "browser_eval",
+                                  return_value={"ok": True, "value": value}) as be:
+            products = bot.fetch_shopee_affiliate_products()
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]["affiliate_link"], "https://shope.ee/abc")
+        self.assertEqual(products[0]["permalink"], "https://shope.ee/abc")
+        self.assertEqual(products[0]["price"], 89.9)
+        self.assertEqual(be.call_args[0][0], bot.SHOPEE_PRODUCT_OFFER_URL)
+
+    def test_portal_link_generation(self):
+        with mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+                mock.patch.object(bot, "expand_url", side_effect=lambda u: u), \
+                mock.patch.object(bot, "browser_eval",
+                                  return_value={"ok": True,
+                                                "value": {"ok": True,
+                                                          "link": "https://shope.ee/ok"}}):
+            link, error = bot.generate_shopee_portal_link(
+                "https://shopee.com.br/product/1/2")
+        self.assertEqual(link, "https://shope.ee/ok")
+        self.assertIsNone(error)
+
+    def test_portal_link_falls_back_to_open_api(self):
+        with mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+                mock.patch.object(bot, "expand_url", side_effect=lambda u: u), \
+                mock.patch.object(bot, "browser_eval",
+                                  return_value={"ok": True,
+                                                "value": {"ok": False,
+                                                          "error": "sem login"}}), \
+                mock.patch.object(bot, "generate_shopee_affiliate_link",
+                                  return_value=("https://shope.ee/api", None)) as api:
+            link, error = bot.generate_shopee_portal_link(
+                "https://shopee.com.br/product/1/2")
+        self.assertEqual(link, "https://shope.ee/api")
+        self.assertIsNone(error)
+        api.assert_called_once()
+
+
+class SeleniumEvalTests(unittest.TestCase):
+    def test_script_value_is_not_double_wrapped(self):
+        driver = mock.Mock()
+        driver.execute_async_script.return_value = {
+            "__selenium_eval__": True,
+            "ok": True,
+            "value": {"ok": True, "products": [1]},
+        }
+        with mock.patch.object(bot, "selenium_driver", return_value=driver):
+            result = bot.selenium_eval("https://example.com", "return 1;", wait=0)
+        self.assertEqual(result, {"ok": True, "value": {"ok": True, "products": [1]}})
 
 
 class PublishTests(unittest.TestCase):
@@ -217,6 +296,21 @@ class PublishTests(unittest.TestCase):
                          "https://meli.la/ok")
         vitrine.assert_called_once()
         self.assertEqual(vitrine.call_args[0][0]["link"], "https://meli.la/ok")
+
+    def test_publish_prefers_affiliate_link(self):
+        product = self._product("pv_test_3")
+        product["affiliate_link"] = "https://shope.ee/ja"
+        with mock.patch.object(bot, "generate_affiliate_link") as gen, \
+                mock.patch.object(bot, "send_message", return_value=True) as send, \
+                mock.patch.object(bot, "save_to_vitrine"), \
+                mock.patch.object(bot, "load_json", return_value={}), \
+                mock.patch.object(bot, "save_json"):
+            ok = bot.publish(product)
+        self.assertTrue(ok)
+        gen.assert_not_called()
+        keyboard = send.call_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["url"],
+                         "https://shope.ee/ja")
 
 
 if __name__ == "__main__":

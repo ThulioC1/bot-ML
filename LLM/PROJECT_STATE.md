@@ -1,6 +1,29 @@
 # Estado do Projeto
 
-> Última atualização: **2026-10-19 (sessão 25 — gerador oficial de links + navegador persistente)**
+> Última atualização: **2026-10-19 (sessão 26 — Shopee pelo portal + correção do link de loja no canal)**
+
+## 🆕 Sessão 26 — Shopee pelo portal de afiliado (19/10)
+
+**Fonte Shopee:** a busca pública (403) foi trocada pelo portal logado
+`affiliate.shopee.com.br/offer/product_offer`. Para cada card o bot clica em
+"Obter link" (`.get-link-btn`), lê o `shope.ee`/`s.shopee.com.br` no
+`.get-link-modal` e publica **esse** link (campo `affiliate_link` do produto).
+`SHOPEE_OFFER_LIMIT` (default `6`) limita os cards por ciclo.
+
+**Publish:** `publish()` usa `product["affiliate_link"]` direto quando existe;
+só chama o gerador quando o produto não veio com link pronto.
+
+**Canal:** `generate_affiliate_link()` agora **expande o link curto antes** de
+decidir se é link de loja — `meli.la` de `/social/` deixa de ser recusado.
+Shopee no canal passa pelo portal (`generate_shopee_portal_link`), com a Open
+API (`generateShortLink`) como reserva.
+
+**Bug de infra corrigido:** `selenium_eval()` devolvia
+`{ok, value:{ok, value:{...}}}` (duplo embrulho); agora devolve o envelope do
+próprio script, como o CDP. Descoberto com fixture HTML no Chrome real.
+
+**Pendência:** validar seletores/sessão no portal real com
+`python bot.py --login-browser` (ver `ISSUES.md`).
 
 ## 🆕 Sessão 25 — o link sai do GERADOR OFICIAL (19/10)
 
@@ -13,7 +36,7 @@ falhar, a oferta **não é publicada** e o dono recebe aviso no privado
 | Loja | Como gera | Requer |
 |---|---|---|
 | Mercado Livre | POST `affiliate-program/api/v2/affiliates/createLink` (fallback DOM `#P0-2`) | login no linkbuilder |
-| Shopee | GraphQL `generateShortLink` na Open API | `SHOPEE_APP_ID` + `SHOPEE_SECRET` |
+| Shopee | portal logado (`/offer/product_offer` → "Obter link"; `/offer/custom_link`); Open API como reserva | login no portal Shopee |
 | Amazon | SiteStripe `getShortUrl` (fallback DOM `#amzn-ss-get-link-button`) | login no Amazon Associados |
 
 **Login (uma vez):** `python bot.py --login-browser` — abre os 3 portais; o
