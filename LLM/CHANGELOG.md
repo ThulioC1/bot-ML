@@ -5,6 +5,85 @@
 
 ---
 
+## [2026-10-19 12:10] — Sessão 26.4: 2 posts de Instagram a cada 3h
+
+**Objetivo:** o dono pediu que o ciclo de 3h (`INTERVAL_INSTAGRAM=10800`)
+publique **2 produtos por vez**, não 1.
+
+**Arquivos alterados:**
+- `bot.py` — novas configs `IG_POSTS_PER_CYCLE` (default `2`) e
+  `IG_POST_DELAY` (default `30`); `instagram_cycle()` agora publica até
+  `IG_POSTS_PER_CYCLE` itens da fila, com `IG_POST_DELAY` de pausa entre
+  eles.
+- `.env.example` — `IG_POSTS_PER_CYCLE=2` e `IG_POST_DELAY=30`.
+- `tests/test_affiliate.py` — `InstagramCycleTests` (2 posts por ciclo;
+  falha mantém o item na fila e para o ciclo).
+
+**Análise / o que foi observado:**
+- A fila é salva a cada post publicado: se o bot cair no meio do ciclo, os
+  posts já feitos não repetem.
+- Se `post_to_instagram` falha (limite/token), o item continua na fila e o
+  ciclo para — os próximos 3h tentam de novo.
+- Capacidade: até 2 posts a cada 3h (~16/dia), limitada pelo que passa no
+  filtro de desconto e pelo tamanho da fila (10 itens).
+
+**Resultado:**
+- ✅ 35 testes passando.
+- ⚠️ Pendente: validar no Instagram real (dois posts por ciclo).
+
+---
+
+## [2026-10-19 11:50] — Sessão 26.3: filtro de desconto no Instagram (`IG_MIN_DISCOUNT`)
+
+**Objetivo:** evitar spam no Instagram — não postar tudo que o canal/privado
+recebe. O dono escolheu o filtro de **desconto mínimo**.
+
+**Arquivos alterados:**
+- `bot.py` — `IG_MIN_DISCOUNT` (default `20`); `schedule_instagram()` só
+  enfileira se houver preço antigo e desconto real ≥ mínimo e devolve
+  `True/False`; a resposta do privado avisa se entrou na fila do IG.
+- `.env.example` — `IG_MIN_DISCOUNT=20`.
+- `tests/test_affiliate.py` — 3 testes do filtro.
+
+**Análise / o que foi observado:**
+- `discount_pct()` devolve `None` quando não há preço antigo; nesse caso a
+  oferta também fica de fora, porque não dá para medir o desconto.
+- `IG_MIN_DISCOUNT=0` desliga o filtro e volta ao comportamento antigo
+  (enfileira tudo que tem imagem).
+
+**Resultado:**
+- ✅ 33 testes passando.
+- ⚠️ Pendente: validar no Instagram real com o percentual escolhido.
+
+---
+
+## [2026-10-19 11:35] — Sessão 26.2: link do privado vai COMO VEIO + Instagram
+
+**Objetivo:** o dono esclareceu que o link que ele manda no privado já é o link
+de afiliado dele ("já tratado com meu código"). O bot **não deve desembrulhar
+nem regenerar**; deve só entrar no link para ler título/preço/imagem e publicar
+no canal **e** na fila do Instagram.
+
+**Arquivos alterados:**
+- `bot.py` — `handle_private_message()` não chama mais
+  `generate_affiliate_link()`: `permalink`/`affiliate_link` = URL recebida;
+  `publish(product, announce_instagram=True)` (canal + fila do IG, quando há
+  imagem); `/canal` sem link também enfileira no IG; `HELP` atualizado.
+- `tests/test_affiliate.py` — testes do privado ajustados (link usado como veio,
+  sem gerador; preço ausente não publica).
+
+**Análise / o que foi observado:**
+- Sem gerador no privado, o erro "link de loja não gera comissão" e a rejeição
+  de link curto não se aplicam mais a esse fluxo.
+- Posts sem imagem continuam só no canal (o IG precisa de imagem).
+
+**Resultado:**
+- ✅ 30 testes passando.
+- ⚠️ Pendente: validar no Telegram/Instagram reais (link ML no privado → canal
+  + arte na fila do IG).
+
+---
+
 ## [2026-10-19 11:15] — Sessão 26.1: link no privado publica direto no canal
 
 **Objetivo:** pedido do usuário — ao mandar um link no privado do bot, ele deve

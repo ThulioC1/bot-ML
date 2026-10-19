@@ -200,6 +200,16 @@ MIN_PRICE = _num_env("MIN_PRICE", 15)
 MAX_PRICE = _num_env("MAX_PRICE", 3000)
 MIN_DISCOUNT = _num_env("MIN_DISCOUNT", 0)      # 0 = nao exige desconto
 
+# Filtro do Instagram: so entra na fila se o desconto real for >= esse valor.
+# Sem preco antigo nao da para medir desconto, entao tambem fica de fora.
+# 0 = desliga e volta a enfileirar tudo que tem imagem.
+IG_MIN_DISCOUNT = _num_env("IG_MIN_DISCOUNT", 20)
+
+# Instagram: quantos posts por ciclo (o ciclo roda a cada INTERVAL_INSTAGRAM,
+# default 3h) e pausa em segundos entre um post e outro.
+IG_POSTS_PER_CYCLE = max(1, int(_num_env("IG_POSTS_PER_CYCLE", 2)))
+IG_POST_DELAY = _num_env("IG_POST_DELAY", 30)
+
 SEEN_FILE = BASE_DIR / "seen.json"
 IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
 VITRINE_FILE = BASE_DIR / "vitrine.json"
@@ -3020,20 +3030,30 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
         })
 
     if announce_instagram:
-        schedule_instagram(product, title, price, old)
+        product["ig_queued"] = schedule_instagram(product, title, price, old)
     return ok
 
 
 def schedule_instagram(product, title, price, old):
+    """Enfileira o post do Instagram. Devolve True se entrou na fila."""
     pct = discount_pct(price, old)
+    if IG_MIN_DISCOUNT > 0:
+        if pct is None:
+            log(f"⏭️ Instagram: '{title[:40]}' sem preço antigo para medir desconto.")
+            return False
+        if pct < IG_MIN_DISCOUNT:
+            log(f"⏭️ Instagram: '{title[:40]}' com {pct:.0f}% de desconto "
+                f"(mínimo {IG_MIN_DISCOUNT:.0f}%).")
+            return False
     image = product.get("thumbnail")
     if not image:
         log("⏭️ Instagram: produto sem imagem.")
-        return
+        return False
     queue = load_json(BASE_DIR / "ig_queue.json", [])
     queue.append({"title": title, "price": price, "old": old, "image": image, "pct": pct})
     save_json(BASE_DIR / "ig_queue.json", queue[-10:])
     log(f"🖼️ Arte do post '{title[:32]}' entrou na fila do Instagram.")
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -3042,14 +3062,15 @@ def schedule_instagram(product, title, price, old):
 
 HELP = (
     "🤖 *Vagante Promoções*\n\n"
-    "Envie um link de produto (Mercado Livre, Shopee, Amazon) que eu extraio "
-    "o preço, gero o link de afiliado e publico no canal.\n\n"
+    "Envie o link JÁ com seu código de afiliado: eu leio título, preço e imagem "
+    "e publico no canal e na fila do Instagram — o link vai como veio, sem "
+    "passar pelo gerador.\n\n"
     "Comandos:\n"
     "/start — esta ajuda\n"
     "/canal <link> — publica direto no canal\n"
     "/canal — publica o último link que você enviou\n"
     "/preco <valor> <link> — monta o post com preço manual\n"
-    "/buscar <termo> — busca ofertas do termo\n"
+    "/buscar <termo> — busca ofertas do termo (essas sim usam o gerador)\n"
     "/lojas — quais lojas do ML o bot está usando\n"
     "/status — diagnóstico das fontes\n"
     "/ajuda — esta ajuda"
@@ -3166,7 +3187,7 @@ def handle_private_message(message):
                          "sozinho para publicar o ultimo.",
                          chat_id=chat_id, reply_to=message_id)
             return
-        if publish(last):
+        if publish(last, announce_instagram=True):
             send_message(f"✅ Publicado no canal: {last['title'][:60]}",
                          chat_id=chat_id, reply_to=message_id)
         else:
@@ -3192,16 +3213,18 @@ def handle_private_message(message):
     old = None if forced_price is not None else data.get("original_price")
     title = data.get("title") or "Oferta Especial"
     image = data.get("image") or ""
-    permalink = data.get("link") or url
-    final_link, link_aviso = generate_affiliate_link(permalink, price, title)
+    # O link que o dono manda ja e o link de afiliado dele: entra no link so
+    # para ler titulo/preco/imagem e publica o link COMO VEIO, sem
+    # desembrulhar nem passar pelo gerador.
+    permalink = url
 
     if price is None:
         send_message(
-            f"⚠️ Não consegli ler o preço de *{title}* automaticamente.\n\n"
+            f"⚠️ Não consegui ler o preço de *{title}* automaticamente.\n\n"
             "O marketplace está bloqueando acesso automatizado (anti-bot). "
             "Verifique o proxy no /status.\n\n"
             "Use o comando manual:\n"
-            f"`/preco 89,90 {final_link or permalink}`",
+            f"`/preco 89,90 {permalink}`",
             chat_id=chat_id, reply_to=message_id,
         )
         return
@@ -3210,30 +3233,27 @@ def handle_private_message(message):
     block = price_block(price, old)
     if block:
         lines += block.split("\n") + [""]
-    lines += [f"🔗 {final_link or permalink}", "",
+    lines += [f"🔗 {permalink}", "",
               f"✅ Preço encontrado: **R$ {brl(price)}**"]
-    if link_aviso:
-        lines += ["", f"⚠️ {link_aviso}"]
     send_message("\n".join(lines), chat_id=chat_id, photo_url=image or None, reply_to=message_id)
 
     product = {"id": "pv_" + hashlib.md5(permalink.encode()).hexdigest()[:10],
                "title": title, "price": price, "original_price": old,
-               "permalink": permalink, "affiliate_link": final_link or "",
+               "permalink": permalink, "affiliate_link": permalink,
                "thumbnail": image, "source": "privado"}
     LAST_PRODUCT[chat_id] = product
 
-    # Link no privado publica direto no canal, igual ao monitoramento dos canais.
-    if not final_link:
-        notify_link_failure(permalink, title, link_aviso)
-        send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
-                     "Rode `python bot.py --login-browser` para renovar a sessão.",
-                     chat_id=chat_id, reply_to=message_id)
-        return
-    if publish(product):
-        send_message("✅ Publicado no canal.", chat_id=chat_id, reply_to=message_id)
+    # Link no privado publica direto no canal e tenta entrar na fila do Instagram.
+    if publish(product, announce_instagram=True):
+        if product.get("ig_queued"):
+            extra = " e na fila do Instagram"
+        elif image:
+            extra = " (Instagram: fora do filtro)"
+        else:
+            extra = " (sem imagem; IG ignorado)"
+        send_message(f"✅ Publicado no canal{extra}.", chat_id=chat_id, reply_to=message_id)
     else:
-        send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
-                     "Rode `python bot.py --login-browser` para renovar a sessão.",
+        send_message("⛔ Não publiquei no canal. Confira o /status e os logs.",
                      chat_id=chat_id, reply_to=message_id)
 
 
@@ -3455,14 +3475,22 @@ def instagram_cycle():
     if not queue:
         log("📸 Instagram: fila vazia.")
         return
-    item = queue[0]
-    pct = item.get("pct")
-    caption = f"🔥 {item['title']}\n\n{price_block(item.get('price'), item.get('old'))}\n\n🔗 Link na bio!"
-    public_url = arte_para_publicar(item.get("image"), item.get("price"), item.get("old"), pct, item.get("title"))
-    if post_to_instagram(public_url, caption):
-        save_json(BASE_DIR / "ig_queue.json", queue[1:])
-    else:
-        log("⏭️ Post do Instagram não concluído; item mantido na fila.")
+    enviados = 0
+    while queue and enviados < IG_POSTS_PER_CYCLE:
+        item = queue[0]
+        pct = item.get("pct")
+        caption = f"🔥 {item['title']}\n\n{price_block(item.get('price'), item.get('old'))}\n\n🔗 Link na bio!"
+        public_url = arte_para_publicar(item.get("image"), item.get("price"), item.get("old"), pct, item.get("title"))
+        if not post_to_instagram(public_url, caption):
+            log("⏭️ Post do Instagram não concluído; item mantido na fila.")
+            break
+        queue = queue[1:]
+        save_json(BASE_DIR / "ig_queue.json", queue)
+        enviados += 1
+        if queue and enviados < IG_POSTS_PER_CYCLE and IG_POST_DELAY > 0:
+            time.sleep(IG_POST_DELAY)
+    if enviados:
+        log(f"📸 Instagram: {enviados} post(s) publicado(s) neste ciclo.")
 
 
 def internet_online(timeout=10):

@@ -314,37 +314,102 @@ class PublishTests(unittest.TestCase):
 
 
 class PrivateLinkTests(unittest.TestCase):
-    def test_private_link_generates_and_publishes(self):
-        url = "https://www.mercadolivre.com.br/produto/p/MLB1"
+    def test_private_link_uses_own_link_and_announces_instagram(self):
+        url = "https://meli.la/2AbCdEf"
         message = {"chat": {"id": 123, "type": "private"}, "message_id": 9,
                    "text": url}
         product_data = {"title": "Fone", "price": 89.9, "original_price": 120.0,
-                        "image": "", "link": url}
+                        "image": "https://img/1.jpg",
+                        "link": "https://www.mercadolivre.com.br/produto/p/MLB1"}
         with mock.patch.object(bot, "extract_product", return_value=product_data), \
-                mock.patch.object(bot, "generate_affiliate_link",
-                                  return_value=("https://meli.la/ok", None)) as gen, \
+                mock.patch.object(bot, "generate_affiliate_link") as gen, \
                 mock.patch.object(bot, "publish", return_value=True) as pub, \
                 mock.patch.object(bot, "send_message"):
             bot.handle_private_message(message)
-        gen.assert_called_once()
+        gen.assert_not_called()
         pub.assert_called_once()
-        self.assertEqual(pub.call_args[0][0]["affiliate_link"], "https://meli.la/ok")
+        product = pub.call_args[0][0]
+        self.assertEqual(product["affiliate_link"], url)
+        self.assertEqual(product["permalink"], url)
+        self.assertTrue(pub.call_args[1].get("announce_instagram"))
 
-    def test_private_link_generator_failure_does_not_publish(self):
-        url = "https://www.mercadolivre.com.br/produto/p/MLB2"
+    def test_private_link_without_price_does_not_publish(self):
+        url = "https://meli.la/2AbCdEg"
         message = {"chat": {"id": 123, "type": "private"}, "message_id": 10,
                    "text": url}
-        product_data = {"title": "Fone", "price": 89.9, "original_price": None,
+        product_data = {"title": "Fone", "price": None, "original_price": None,
                         "image": "", "link": url}
         with mock.patch.object(bot, "extract_product", return_value=product_data), \
-                mock.patch.object(bot, "generate_affiliate_link",
-                                  return_value=(None, "sem login")), \
+                mock.patch.object(bot, "generate_affiliate_link") as gen, \
                 mock.patch.object(bot, "publish") as pub, \
-                mock.patch.object(bot, "notify_link_failure") as notify, \
-                mock.patch.object(bot, "send_message"):
+                mock.patch.object(bot, "send_message") as send:
             bot.handle_private_message(message)
+        gen.assert_not_called()
         pub.assert_not_called()
-        notify.assert_called_once()
+        sent = " ".join(str(c) for c in send.call_args_list)
+        self.assertIn(url, sent)
+
+
+class InstagramFilterTests(unittest.TestCase):
+    def _schedule(self, price, old, ig_min):
+        with mock.patch.object(bot, "IG_MIN_DISCOUNT", ig_min), \
+                mock.patch.object(bot, "load_json", return_value=[]), \
+                mock.patch.object(bot, "save_json") as save:
+            queued = bot.schedule_instagram({"thumbnail": "https://img/1.jpg"},
+                                            "Fone", price, old)
+        return queued, save
+
+    def test_skips_without_min_discount(self):
+        queued, save = self._schedule(100.0, None, 20)
+        self.assertFalse(queued)
+        save.assert_not_called()
+        queued, save = self._schedule(100.0, 105.0, 20)
+        self.assertFalse(queued)
+        save.assert_not_called()
+
+    def test_queues_with_enough_discount(self):
+        queued, save = self._schedule(80.0, 100.0, 20)
+        self.assertTrue(queued)
+        save.assert_called_once()
+
+    def test_zero_disables_filter(self):
+        queued, save = self._schedule(100.0, None, 0)
+        self.assertTrue(queued)
+        save.assert_called_once()
+
+
+class InstagramCycleTests(unittest.TestCase):
+    def _queue_item(self, title):
+        return {"title": title, "price": 80.0, "old": 100.0,
+                "image": "https://img/1.jpg", "pct": 20.0}
+
+    def test_posts_two_per_cycle(self):
+        queue = [self._queue_item(t) for t in ("a", "b", "c")]
+        with mock.patch.object(bot, "IG_POSTS_PER_CYCLE", 2), \
+                mock.patch.object(bot, "IG_POST_DELAY", 0), \
+                mock.patch.object(bot, "load_json", return_value=queue), \
+                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "arte_para_publicar",
+                                  return_value="https://img/arte.jpg"), \
+                mock.patch.object(bot, "post_to_instagram",
+                                  return_value=True) as post:
+            bot.instagram_cycle()
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(len(save.call_args_list[-1][0][1]), 1)
+
+    def test_failure_keeps_item_and_stops(self):
+        queue = [self._queue_item("a"), self._queue_item("b")]
+        with mock.patch.object(bot, "IG_POSTS_PER_CYCLE", 2), \
+                mock.patch.object(bot, "IG_POST_DELAY", 0), \
+                mock.patch.object(bot, "load_json", return_value=queue), \
+                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "arte_para_publicar",
+                                  return_value="https://img/arte.jpg"), \
+                mock.patch.object(bot, "post_to_instagram",
+                                  return_value=False) as post:
+            bot.instagram_cycle()
+        self.assertEqual(post.call_count, 1)
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

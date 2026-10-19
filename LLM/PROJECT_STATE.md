@@ -13,14 +13,25 @@
 **Publish:** `publish()` usa `product["affiliate_link"]` direto quando existe;
 só chama o gerador quando o produto não veio com link pronto.
 
-**Privado:** mandar um link no privado gera o link de afiliado (mesmo roteador
-do canal) e **publica direto no canal**, sem `/canal`. O `/preco` segue igual e
-também publica; se o gerador falhar, o admin é avisado e nada é postado.
+**Privado:** o link que o dono manda no privado **já é o link de afiliado
+dele** — o bot entra no link apenas para ler título/preço/imagem e publica o
+link **como veio** (sem gerador/desembrulho) no canal e na fila do Instagram
+(`announce_instagram=True`, quando há imagem). `/preco` e `/canal` idem; sem
+preço lido, só sugere o `/preco` e não publica. `/buscar` continua usando o
+gerador (ofertas raspadas, não são links do dono).
 
 **Canal:** `generate_affiliate_link()` agora **expande o link curto antes** de
 decidir se é link de loja — `meli.la` de `/social/` deixa de ser recusado.
 Shopee no canal passa pelo portal (`generate_shopee_portal_link`), com a Open
 API (`generateShortLink`) como reserva.
+
+**Instagram:** `IG_MIN_DISCOUNT` (default `20`) — a oferta só entra na fila do
+IG se tiver preço antigo e desconto real ≥ 20%. `0` desliga o filtro (posta
+tudo que tem imagem). O ciclo do IG roda a cada `INTERVAL_INSTAGRAM` (3h) e
+publica até `IG_POSTS_PER_CYCLE` (default `2`), com pausa de `IG_POST_DELAY`
+(30s) entre um post e outro; se um post falha, o item fica na fila. Outros
+filtros (teto diário, faixa de preço, dedup, `/ig` manual) ficaram como opção
+futura.
 
 **Bug de infra corrigido:** `selenium_eval()` devolvia
 `{ok, value:{ok, value:{...}}}` (duplo embrulho); agora devolve o envelope do
@@ -253,4 +264,4 @@ O `bot.py` é **tolerante a falhas**: `curl_cffi`, `Pillow`, `selenium` e
 `telethon` são importados sob demanda dentro de `try/except`.
 
 Defaults: `INTERVAL_TELEGRAM=3600` · `INTERVAL_INSTAGRAM=10800` ·
-`POSTS_PER_CYCLE=2`.
+`POSTS_PER_CYCLE=2` · `IG_POSTS_PER_CYCLE=2` · `IG_POST_DELAY=30`.
