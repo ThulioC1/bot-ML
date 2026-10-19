@@ -5,6 +5,100 @@
 
 ---
 
+## [2026-10-19 14:15] — Sessão 26.7: Shopee fora do anti-bot (Open API + detecção)
+
+**Objetivo:** o dono relatou tela de anti-bot na Shopee; contornar sem
+depender do site público.
+
+**Arquivos alterados:**
+- `bot.py` — `fetch_shopee_products_api()` (`productOfferV2` na Open API
+  oficial); `fetch_shopee_products()` usa portal → Open API → site público
+  (este só em `/buscar` sem credenciais); `generate_shopee_portal_link()`
+  tenta a Open API primeiro quando há credenciais; `_shopee_search_data()`
+  detecta `verify/traffic`, `captcha` e `90309999` e aborta com log claro;
+  `--login-browser` abre também `shopee.com.br` para resolver o desafio à mão.
+- `tests/test_affiliate.py` — `ShopeeOpenApiTests` (3) e `ShopeeAntiBotTests`
+  (1); testes do portal ajustados para o novo ordem (API-first).
+- `.env.example` — nota de que App ID/Secret evitam o anti-bot.
+
+**Análise / o que foi observado:**
+- Teste AO VIVO com as credenciais do `.env`: `productOfferV2` devolveu 6
+  produtos com `offerLink` (`s.shopee.com.br/...`), preço em string decimal
+  (`"98.89"`) e `priceDiscountRate` numérico; o parser converte os dois
+  formatos e calcula o preço antigo quando há desconto.
+- O caminho público (`/api/v4/search/search_items`) é o que cai no anti-bot;
+  com credenciais ele deixa de ser usado no ciclo e no `/buscar`, virando
+  último recurso.
+- Se o portal estiver sem login, a API cobre os produtos; se a API falhar, o
+  portal ainda é tentado.
+
+**Resultado:**
+- ✅ 43 testes passando.
+- ✅ Open API validada ao vivo (produtos + links).
+- ⚠️ Portal Shopee logado continua sem validação ao vivo (issue existente).
+
+---
+
+## [2026-10-19 13:00] — Sessão 26.6: diagnóstico dos cupons do ML (`/diagcupons`)
+
+**Objetivo:** capturar o HTML da página de cupons do ML com o navegador
+logado do bot, para escrever o parser com a estrutura real.
+
+**Arquivos alterados:**
+- `bot.py` — `ML_COUPONS_URL` (`/ofertas/cupons`), `ML_PROMOS_URL`
+  (`/l/promocoes`), `send_document()` e o comando `/diagcupons` (restrito ao
+  `ADMIN_CHAT_ID`); salva `cupons_debug_<pagina>.html` na pasta do bot,
+  detecta parede de login/erro do ML e envia os arquivos no privado.
+- `HELP` — linha do `/diagcupons`.
+
+**Análise / o que foi observado:**
+- A página antiga `mercadolivre.com.br/cupons` dá erro/redireciona para
+  login; a que está indexada e com conteúdo é `/ofertas/cupons` (cupons
+  ativados, sem código) e `/l/promocoes` (seção CUPONS, com códigos e
+  condições).
+- Neste PC (workspace Windows) o ML devolve "Hubo un error accediendo a esta
+  pagina..." para todas as páginas, inclusive `/ofertas` e `/social/` — é
+  bloqueio do ambiente, não da URL. Por isso a validação tem de ser no Kali.
+- O comando não tenta interpretar os cupons ainda: é só a captura para
+  diagnóstico. O parser entra depois, com o HTML real em mãos.
+
+**Resultado:**
+- ✅ 38 testes passando.
+- ⚠️ Pendente: dono rodar `--login-browser`, entrar no ML, enviar
+  `/diagcupons` e mandar o `cupons_debug.html`.
+
+---
+
+## [2026-10-19 12:35] — Sessão 26.5: `/buscar` ordena pela melhor oferta
+
+**Objetivo:** o dono quer que a busca por nome devolva a **melhor promoção
+primeiro** e sem resultados fora do termo.
+
+**Arquivos alterados:**
+- `bot.py` — `busca_relevante()` e `rank_ofertas()`; `/buscar` filtra
+  itens fora do termo (inclusive os da planilha) e ordena por maior
+  desconto / menor preço antes de pegar os 5.
+- `tests/test_affiliate.py` — `BuscaTests` (3 testes).
+
+**Análise / o que foi observado:**
+- `collect_products()` sempre inclui a planilha e embaralha
+  (`random.shuffle`); antes, `/buscar` podia devolver produto aleatório da
+  planilha que nem tinha a ver com o termo.
+- Desconto usa `discount_pct()`; sem preço antigo a oferta vai para o fim,
+  ordenada por menor preço.
+
+**Resultado:**
+- ✅ 38 testes passando.
+
+**Cupons ML (investigação para a próxima sessão):**
+- `mercadolivre.com.br/cupons` agora **exige login** (redireciona para
+  `/login/identification`); não existe API pública de cupons (testado
+  `api.mercadolibre.com/coupons` e variantes: 404). Só dá para raspar com a
+  sessão logada do navegador do bot — falta capturar o HTML logado para
+  escrever o parser.
+
+---
+
 ## [2026-10-19 12:10] — Sessão 26.4: 2 posts de Instagram a cada 3h
 
 **Objetivo:** o dono pediu que o ciclo de 3h (`INTERVAL_INSTAGRAM=10800`)

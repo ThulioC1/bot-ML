@@ -8,7 +8,10 @@
 `affiliate.shopee.com.br/offer/product_offer`. Para cada card o bot clica em
 "Obter link" (`.get-link-btn`), lê o `shope.ee`/`s.shopee.com.br` no
 `.get-link-modal` e publica **esse** link (campo `affiliate_link` do produto).
-`SHOPEE_OFFER_LIMIT` (default `6`) limita os cards por ciclo.
+`SHOPEE_OFFER_LIMIT` (default `6`) limita os cards por ciclo. Se o portal vier
+vazio, `fetch_shopee_products_api()` usa `productOfferV2` da Open API (sem
+navegador); o site público só é tocado em `/buscar` sem credenciais, com
+detecção de anti-bot (`verify/traffic`, `captcha`, `90309999`).
 
 **Publish:** `publish()` usa `product["affiliate_link"]` direto quando existe;
 só chama o gerador quando o produto não veio com link pronto.
@@ -22,8 +25,18 @@ gerador (ofertas raspadas, não são links do dono).
 
 **Canal:** `generate_affiliate_link()` agora **expande o link curto antes** de
 decidir se é link de loja — `meli.la` de `/social/` deixa de ser recusado.
-Shopee no canal passa pelo portal (`generate_shopee_portal_link`), com a Open
-API (`generateShortLink`) como reserva.
+Shopee no canal usa a Open API (`generateShortLink`) primeiro quando há
+`SHOPEE_APP_ID`/`SHOPEE_SECRET`; o portal (`generate_shopee_portal_link`) fica
+como reserva.
+
+**Busca:** `/buscar <termo>` filtra resultados fora do termo (inclusive os da
+planilha) e ordena por maior desconto / menor preço antes de enviar os 5.
+
+**Cupons ML:** não há API pública; as páginas úteis são `/ofertas/cupons`
+(cupons ativados) e `/l/promocoes` (seção CUPONS, com códigos). O comando
+`/diagcupons` (dono) abre as duas no Chrome logado, salva
+`cupons_debug_<pagina>.html` e envia no privado; o parser será escrito com
+esse HTML real (pendente).
 
 **Instagram:** `IG_MIN_DISCOUNT` (default `20`) — a oferta só entra na fila do
 IG se tiver preço antigo e desconto real ≥ 20%. `0` desliga o filtro (posta

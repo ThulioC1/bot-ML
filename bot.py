@@ -112,6 +112,11 @@ ML_LINKBUILDER_URL = "https://www.mercadolivre.com.br/afiliados/linkbuilder"
 SHOPEE_AFFILIATE_URL = "https://affiliate.shopee.com.br/"
 SHOPEE_PRODUCT_OFFER_URL = "https://affiliate.shopee.com.br/offer/product_offer"
 SHOPEE_CUSTOM_LINK_URL = "https://affiliate.shopee.com.br/offer/custom_link"
+ML_COUPONS_URL = "https://mercadolivre.com.br/ofertas/cupons"
+ML_PROMOS_URL = "https://mercadolivre.com.br/l/promocoes"
+# Sinais da tela de anti-bot da Shopee (site publico).
+SHOPEE_BOT_MARKERS = ("verify/traffic", "anti-bot", "antibot", "captcha",
+                      "suspicious", "90309999")
 AMAZON_HOME_URL = "https://www.amazon.com.br/"
 try:
     SHOPEE_OFFER_LIMIT = max(1, int(env("SHOPEE_OFFER_LIMIT", "6") or 6))
@@ -886,13 +891,25 @@ def generate_shopee_affiliate_link(url):
 
 
 def generate_shopee_portal_link(url):
-    """Gera o link no portal logado da Shopee; Open API entra como reserva."""
-    if not BROWSER_SCRAPING:
-        return generate_shopee_affiliate_link(url)
+    """Gera o link pela Open API; portal logado entra como reserva.
+
+    A Open API não passa pelo anti-bot do site/portal. O portal só é usado
+    quando não há SHOPEE_APP_ID/SHOPEE_SECRET ou quando a API falha.
+    """
     url = _normalize_affiliate_url(url, "shopee")
     short_error = _short_input_error("shopee", url)
     if short_error:
         return short_error
+    api_error = None
+    if SHOPEE_APP_ID and SHOPEE_SECRET:
+        link, api_error = generate_shopee_affiliate_link(url)
+        if link:
+            return link, None
+        log(f"↪️ Shopee Open API falhou ({api_error}); tentando o portal logado.")
+    if not BROWSER_SCRAPING:
+        if SHOPEE_APP_ID and SHOPEE_SECRET:
+            return None, api_error or "Open API indisponível"
+        return generate_shopee_affiliate_link(url)
 
     script = r"""
     const target = __TARGET__;
@@ -1307,6 +1324,24 @@ def send_message(text, chat_id=None, photo_url=None, reply_to=None, reply_markup
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     return bool(tg_api("sendMessage", payload))
+
+
+def send_document(path, chat_id=None, caption=""):
+    """Envia um arquivo no Telegram (ex.: HTML de diagnóstico)."""
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id:
+        log("⚠️ Token ou Chat ID do Telegram ausentes.")
+        return False
+    path = Path(path)
+    try:
+        with open(path, "rb") as fh:
+            result = tg_api("sendDocument",
+                            {"chat_id": chat_id, "caption": caption[:1024]},
+                            files={"document": (path.name, fh)}, timeout=120)
+        return bool(result)
+    except Exception as exc:
+        log(f"⚠️ Telegram sendDocument: {exc}")
+        return False
 
 
 def get_chat_name(chat_id):
@@ -1943,6 +1978,7 @@ def browser_login_session():
     portais = [
         ("Mercado Livre Afiliados", ML_LINKBUILDER_URL),
         ("Shopee Afiliados", SHOPEE_AFFILIATE_URL),
+        ("Shopee (site público)", "https://shopee.com.br/"),
         ("Amazon Associados", AMAZON_HOME_URL),
     ]
     log("🔐 Abrindo os portais de afiliado. Faça login em cada aba.")
@@ -2502,8 +2538,15 @@ def _shopee_search_data(keyword):
         result = browser_eval("https://shopee.com.br/", script, wait=3,
                               timeout=LINK_GEN_TIMEOUT)
         if result and result.get("ok") and result.get("value"):
+            raw = result["value"]
+            low = raw.lower() if isinstance(raw, str) else ""
+            if any(m in low for m in SHOPEE_BOT_MARKERS):
+                log("⚠️ Shopee: tela anti-bot na busca pública. Configure "
+                    "SHOPEE_APP_ID/SHOPEE_SECRET (Open API) ou resolva o desafio "
+                    "no --login-browser.")
+                return None
             try:
-                return json.loads(result["value"])
+                return json.loads(raw)
             except Exception as exc:
                 log(f"⚠️ Shopee (navegador): JSON inválido ({type(exc).__name__}).")
 
@@ -2513,6 +2556,10 @@ def _shopee_search_data(keyword):
                              "x-api-source": "pc", "x-shopee-language": "pt",
                              "x-requested-with": "XMLHttpRequest"})
     if resp is not None and resp.status_code == 200:
+        low = (resp.text or "")[:4000].lower()
+        if any(m in low for m in SHOPEE_BOT_MARKERS):
+            log("⚠️ Shopee: anti-bot na busca HTTP. Use a Open API ou o portal.")
+            return None
         try:
             return resp.json()
         except Exception as exc:
@@ -2687,13 +2734,89 @@ def fetch_shopee_affiliate_products(search_query=None):
     return products
 
 
+def fetch_shopee_products_api(search_query=None):
+    """Ofertas pela Open API oficial (sem navegador, sem anti-bot)."""
+    if not SHOPEE_APP_ID or not SHOPEE_SECRET:
+        return []
+    keyword = (search_query or "ofertas").replace('"', '\\"')
+    query = ('{ productOfferV2(keyword: "%s", sortType: 1, page: 1, limit: %d) '
+             '{ nodes { productName itemId shopId price priceMin priceMax '
+             'priceDiscountRate imageUrl productLink offerLink sales } '
+             'pageInfo { page limit hasNextPage } } }'
+             % (keyword, SHOPEE_OFFER_LIMIT))
+    body = json.dumps({"query": query}, ensure_ascii=False, separators=(",", ":"))
+    _, authorization = _shopee_authorization(body)
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": authorization}
+    try:
+        resp = requests.post(SHOPEE_API_URL, data=body.encode("utf-8"),
+                             headers=headers, timeout=LINK_GEN_TIMEOUT)
+    except Exception as exc:
+        log(f"⚠️ Shopee Open API: {type(exc).__name__}: {exc}")
+        return []
+    if resp.status_code != 200:
+        log(f"⚠️ Shopee Open API: HTTP {resp.status_code}: {resp.text[:160]}")
+        return []
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log(f"⚠️ Shopee Open API: JSON inválido ({type(exc).__name__}).")
+        return []
+    if data.get("errors"):
+        log(f"⚠️ Shopee Open API: {str(data['errors'])[:200]}")
+        return []
+
+    nodes = (((data.get("data") or {}).get("productOfferV2") or {}).get("nodes") or [])
+    products = []
+    for node in nodes:
+        title = str(node.get("productName") or "").strip()
+        price = parse_money(node.get("price")) or parse_money(node.get("priceMin"))
+        link = str(node.get("offerLink") or node.get("productLink") or "").strip()
+        if not title or not price or not link:
+            continue
+        try:
+            pct = float(str(node.get("priceDiscountRate") or "0")
+                        .replace("%", "").replace(",", ".").strip())
+        except ValueError:
+            pct = 0.0
+        old = price / (1 - pct / 100) if pct > 0 and price else None
+        item_id, shop_id = node.get("itemId"), node.get("shopId")
+        products.append({
+            "id": (f"shopee_{shop_id}_{item_id}" if item_id and shop_id
+                   else "shopee_" + hashlib.md5(link.encode()).hexdigest()[:12]),
+            "title": title[:180],
+            "price": price,
+            "original_price": old,
+            "permalink": link,
+            "affiliate_link": str(node.get("offerLink") or ""),
+            "thumbnail": str(node.get("imageUrl") or ""),
+            "source": "shopee_api",
+        })
+    if search_query and products:
+        wanted = _keywords(search_query)
+        products = [p for p in products if _keywords(p["title"]) & wanted]
+    if products:
+        log(f"✅ Shopee (Open API): {len(products)} produto(s).")
+    return products
+
+
 def fetch_shopee_products(search_query=None):
     products = fetch_shopee_affiliate_products(search_query)
-    if products or not search_query:
+    if products:
+        random.shuffle(products)
+        log(f"✅ Shopee (portal): {len(products)} produto(s).")
+        return products
+
+    # Portal vazio (ou sem login): tenta a Open API antes de encostar no site
+    # público, que é onde aparece a tela de anti-bot.
+    if SHOPEE_APP_ID and SHOPEE_SECRET:
+        products = fetch_shopee_products_api(search_query)
         if products:
             random.shuffle(products)
-            log(f"✅ Shopee (portal): {len(products)} produto(s).")
-        return products
+            return products
+
+    if not search_query:
+        return []
 
     products = []
     keyword = search_query or "ofertas"
@@ -2785,6 +2908,24 @@ def oferta_valida(product):
         if desconto < MIN_DISCOUNT:
             return False, f"desconto de só {desconto:.0f}%"
     return True, ""
+
+
+def busca_relevante(product, query):
+    """O produto tem a ver com o termo buscado? (sem acento, por palavra)"""
+    wanted = _keywords(query)
+    return not wanted or bool(wanted & _keywords(product.get("title", "")))
+
+
+def rank_ofertas(products):
+    """Melhor oferta primeiro: maior desconto; sem desconto, menor preço."""
+    def chave(p):
+        pct = discount_pct(p.get("price"), p.get("original_price")) or 0
+        preco = p.get("price")
+        if not isinstance(preco, (int, float)):
+            preco = float("inf")
+        return (-pct, preco)
+
+    return sorted(products, key=chave)
 
 
 def collect_products(include_scrape=True, search_query=None):
@@ -3071,6 +3212,7 @@ HELP = (
     "/canal — publica o último link que você enviou\n"
     "/preco <valor> <link> — monta o post com preço manual\n"
     "/buscar <termo> — busca ofertas do termo (essas sim usam o gerador)\n"
+    "/diagcupons — (dono) captura o HTML da página de cupons do ML\n"
     "/lojas — quais lojas do ML o bot está usando\n"
     "/status — diagnóstico das fontes\n"
     "/ajuda — esta ajuda"
@@ -3145,7 +3287,9 @@ def handle_private_message(message):
             send_message("Uso: /buscar <termo>", chat_id=chat_id, reply_to=message_id)
             return
         send_message(f"🔎 Buscando '{query}'...", chat_id=chat_id, reply_to=message_id)
-        results = collect_products(include_scrape=True, search_query=query)[:5]
+        found = collect_products(include_scrape=True, search_query=query)
+        found = [p for p in found if busca_relevante(p, query)]
+        results = rank_ofertas(found)[:5]
         if not results:
             send_message("❌ Nenhuma oferta encontrada. Os sites podem estar bloqueando o acesso "
                          "automático — nesse caso use a planilha.", chat_id=chat_id, reply_to=message_id)
@@ -3168,6 +3312,46 @@ def handle_private_message(message):
         if falhas:
             texto += f"\n\n⚠️ {falhas} oferta(s) sem link de afiliado foram omitidas."
         send_message(texto, chat_id=chat_id, reply_to=message_id)
+        return
+
+    if text.startswith("/diagcupons"):
+        admin = env("ADMIN_CHAT_ID")
+        if admin and str(chat_id) != str(admin):
+            send_message("⛔ Comando restrito ao dono.", chat_id=chat_id, reply_to=message_id)
+            return
+        send_message("🔎 Abrindo as páginas de cupons no navegador do bot...",
+                     chat_id=chat_id, reply_to=message_id)
+        enviados = 0
+        for nome, url in (("ofertas_cupons", ML_COUPONS_URL),
+                          ("promocoes", ML_PROMOS_URL)):
+            page = browser_get(url, wait=6)
+            if page is None:
+                send_message(f"❌ Não consegui abrir {url}.", chat_id=chat_id,
+                             reply_to=message_id)
+                continue
+            html = page.text or ""
+            path = BASE_DIR / f"cupons_debug_{nome}.html"
+            path.write_text(html, encoding="utf-8", errors="replace")
+            low = html.lower()
+            url_final = getattr(page, "url", "") or ""
+            login = ("login/identification" in url_final.lower()
+                     or "digite seu e-mail" in low
+                     or "iniciar sessão" in low or "iniciar sessao" in low)
+            bloqueio = "hubo un error accediendo" in low
+            resumo = (f"📄 Página de cupons capturada\n"
+                      f"• URL: {url_final}\n"
+                      f"• Tamanho: {len(html)} caracteres\n"
+                      f"• Login: {'SIM — entre no ML pelo --login-browser' if login else 'parece logado'}\n"
+                      f"{'• ML devolveu página de ERRO/bloqueio' + chr(10) if bloqueio else ''}"
+                      f"• Arquivo: {path.name}")
+            if send_document(path, chat_id=chat_id, caption=resumo):
+                enviados += 1
+            else:
+                send_message(resumo + f"\n\n⚠️ Não consegui enviar o arquivo; copie {path} do servidor.",
+                             chat_id=chat_id, reply_to=message_id)
+        send_message(f"📎 {enviados} arquivo(s) enviado(s). Me mande o(s) HTML(s) "
+                     "para eu escrever o parser dos cupons.", chat_id=chat_id,
+                     reply_to=message_id)
         return
 
     urls = re.findall(r"https?://[^\s]+", text)

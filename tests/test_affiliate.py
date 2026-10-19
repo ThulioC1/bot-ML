@@ -218,7 +218,9 @@ class ShopeePortalTests(unittest.TestCase):
         self.assertEqual(be.call_args[0][0], bot.SHOPEE_PRODUCT_OFFER_URL)
 
     def test_portal_link_generation(self):
-        with mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+        with mock.patch.object(bot, "SHOPEE_APP_ID", ""), \
+                mock.patch.object(bot, "SHOPEE_SECRET", ""), \
+                mock.patch.object(bot, "BROWSER_SCRAPING", True), \
                 mock.patch.object(bot, "expand_url", side_effect=lambda u: u), \
                 mock.patch.object(bot, "browser_eval",
                                   return_value={"ok": True,
@@ -229,8 +231,25 @@ class ShopeePortalTests(unittest.TestCase):
         self.assertEqual(link, "https://shope.ee/ok")
         self.assertIsNone(error)
 
+    def test_portal_link_prefers_open_api(self):
+        with mock.patch.object(bot, "SHOPEE_APP_ID", "app"), \
+                mock.patch.object(bot, "SHOPEE_SECRET", "secret"), \
+                mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+                mock.patch.object(bot, "expand_url", side_effect=lambda u: u), \
+                mock.patch.object(bot, "generate_shopee_affiliate_link",
+                                  return_value=("https://shope.ee/api", None)) as api, \
+                mock.patch.object(bot, "browser_eval") as be:
+            link, error = bot.generate_shopee_portal_link(
+                "https://shopee.com.br/product/1/2")
+        self.assertEqual(link, "https://shope.ee/api")
+        self.assertIsNone(error)
+        api.assert_called_once()
+        be.assert_not_called()
+
     def test_portal_link_falls_back_to_open_api(self):
-        with mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+        with mock.patch.object(bot, "SHOPEE_APP_ID", ""), \
+                mock.patch.object(bot, "SHOPEE_SECRET", ""), \
+                mock.patch.object(bot, "BROWSER_SCRAPING", True), \
                 mock.patch.object(bot, "expand_url", side_effect=lambda u: u), \
                 mock.patch.object(bot, "browser_eval",
                                   return_value={"ok": True,
@@ -243,6 +262,63 @@ class ShopeePortalTests(unittest.TestCase):
         self.assertEqual(link, "https://shope.ee/api")
         self.assertIsNone(error)
         api.assert_called_once()
+
+
+class ShopeeOpenApiTests(unittest.TestCase):
+    def _resp(self):
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"data": {"productOfferV2": {"nodes": [
+            {"productName": "Fone X", "itemId": 1, "shopId": 2,
+             "price": "R$ 80,00", "priceMin": "R$ 80,00",
+             "priceDiscountRate": "20%", "imageUrl": "https://img/x.jpg",
+             "productLink": "https://shopee.com.br/product/2/1",
+             "offerLink": "https://shope.ee/xyz"},
+        ]}}}
+        return resp
+
+    def test_products_from_open_api(self):
+        with mock.patch.object(bot, "SHOPEE_APP_ID", "app"), \
+                mock.patch.object(bot, "SHOPEE_SECRET", "secret"), \
+                mock.patch.object(bot, "SHOPEE_OFFER_LIMIT", 6), \
+                mock.patch("requests.post", return_value=self._resp()) as post:
+            products = bot.fetch_shopee_products_api("fone")
+        self.assertEqual(len(products), 1)
+        product = products[0]
+        self.assertEqual(product["price"], 80.0)
+        self.assertAlmostEqual(product["original_price"], 100.0)
+        self.assertEqual(product["affiliate_link"], "https://shope.ee/xyz")
+        body = post.call_args.kwargs["data"].decode("utf-8")
+        self.assertIn("productOfferV2", body)
+
+    def test_missing_credentials_returns_empty(self):
+        with mock.patch.object(bot, "SHOPEE_APP_ID", ""), \
+                mock.patch.object(bot, "SHOPEE_SECRET", ""):
+            self.assertEqual(bot.fetch_shopee_products_api("fone"), [])
+
+    def test_products_fall_back_to_api_before_scraping(self):
+        with mock.patch.object(bot, "fetch_shopee_affiliate_products",
+                               return_value=[]), \
+                mock.patch.object(bot, "SHOPEE_APP_ID", "app"), \
+                mock.patch.object(bot, "SHOPEE_SECRET", "secret"), \
+                mock.patch.object(bot, "fetch_shopee_products_api",
+                                  return_value=[{"id": "x", "title": "t",
+                                                 "price": 1.0}]) as api, \
+                mock.patch.object(bot, "_shopee_search_data") as scrape:
+            products = bot.fetch_shopee_products("fone")
+        self.assertEqual(len(products), 1)
+        api.assert_called_once()
+        scrape.assert_not_called()
+
+
+class ShopeeAntiBotTests(unittest.TestCase):
+    def test_public_search_detects_bot_wall(self):
+        with mock.patch.object(bot, "BROWSER_SCRAPING", True), \
+                mock.patch.object(bot, "browser_eval",
+                                  return_value={"ok": True,
+                                                "value": "<html>verify/traffic</html>"}), \
+                mock.patch.object(bot, "http_get") as http:
+            self.assertIsNone(bot._shopee_search_data("fone"))
+        http.assert_not_called()
 
 
 class SeleniumEvalTests(unittest.TestCase):
@@ -348,6 +424,28 @@ class PrivateLinkTests(unittest.TestCase):
         pub.assert_not_called()
         sent = " ".join(str(c) for c in send.call_args_list)
         self.assertIn(url, sent)
+
+
+class BuscaTests(unittest.TestCase):
+    def test_rank_puts_biggest_discount_first(self):
+        items = [
+            {"title": "C", "price": 10.0, "original_price": None},
+            {"title": "A", "price": 50.0, "original_price": 100.0},
+            {"title": "B", "price": 80.0, "original_price": 100.0},
+        ]
+        self.assertEqual([p["title"] for p in bot.rank_ofertas(items)],
+                         ["A", "B", "C"])
+
+    def test_rank_uses_lowest_price_without_discount(self):
+        items = [{"title": "caro", "price": 200.0},
+                 {"title": "barato", "price": 100.0}]
+        self.assertEqual([p["title"] for p in bot.rank_ofertas(items)],
+                         ["barato", "caro"])
+
+    def test_relevante_matches_word_without_accent(self):
+        product = {"title": "Fone de Ouvido Bluetooth"}
+        self.assertTrue(bot.busca_relevante(product, "fone bluetooth"))
+        self.assertFalse(bot.busca_relevante(product, "panela"))
 
 
 class InstagramFilterTests(unittest.TestCase):
