@@ -13,6 +13,10 @@
 **Publish:** `publish()` usa `product["affiliate_link"]` direto quando existe;
 só chama o gerador quando o produto não veio com link pronto.
 
+**Privado:** mandar um link no privado gera o link de afiliado (mesmo roteador
+do canal) e **publica direto no canal**, sem `/canal`. O `/preco` segue igual e
+também publica; se o gerador falhar, o admin é avisado e nada é postado.
+
 **Canal:** `generate_affiliate_link()` agora **expande o link curto antes** de
 decidir se é link de loja — `meli.la` de `/social/` deixa de ser recusado.
 Shopee no canal passa pelo portal (`generate_shopee_portal_link`), com a Open

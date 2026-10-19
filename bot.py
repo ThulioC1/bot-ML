@@ -3043,7 +3043,7 @@ def schedule_instagram(product, title, price, old):
 HELP = (
     "🤖 *Vagante Promoções*\n\n"
     "Envie um link de produto (Mercado Livre, Shopee, Amazon) que eu extraio "
-    "o preço e monto o post.\n\n"
+    "o preço, gero o link de afiliado e publico no canal.\n\n"
     "Comandos:\n"
     "/start — esta ajuda\n"
     "/canal <link> — publica direto no canal\n"
@@ -3218,18 +3218,22 @@ def handle_private_message(message):
 
     product = {"id": "pv_" + hashlib.md5(permalink.encode()).hexdigest()[:10],
                "title": title, "price": price, "original_price": old,
-               "permalink": permalink, "thumbnail": image, "source": "privado"}
+               "permalink": permalink, "affiliate_link": final_link or "",
+               "thumbnail": image, "source": "privado"}
     LAST_PRODUCT[chat_id] = product
 
-    if text.startswith("/canal"):
-        if publish(product):
-            send_message("✅ Publicado no canal.", chat_id=chat_id, reply_to=message_id)
-        else:
-            send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
-                         "Rode `python bot.py --login-browser` para renovar a sessão.",
-                         chat_id=chat_id, reply_to=message_id)
+    # Link no privado publica direto no canal, igual ao monitoramento dos canais.
+    if not final_link:
+        notify_link_failure(permalink, title, link_aviso)
+        send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
+                     "Rode `python bot.py --login-browser` para renovar a sessão.",
+                     chat_id=chat_id, reply_to=message_id)
+        return
+    if publish(product):
+        send_message("✅ Publicado no canal.", chat_id=chat_id, reply_to=message_id)
     else:
-        send_message("💡 Use `/canal` para publicar este produto no canal.",
+        send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
+                     "Rode `python bot.py --login-browser` para renovar a sessão.",
                      chat_id=chat_id, reply_to=message_id)
 
 

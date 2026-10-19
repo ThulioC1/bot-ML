@@ -313,5 +313,39 @@ class PublishTests(unittest.TestCase):
                          "https://shope.ee/ja")
 
 
+class PrivateLinkTests(unittest.TestCase):
+    def test_private_link_generates_and_publishes(self):
+        url = "https://www.mercadolivre.com.br/produto/p/MLB1"
+        message = {"chat": {"id": 123, "type": "private"}, "message_id": 9,
+                   "text": url}
+        product_data = {"title": "Fone", "price": 89.9, "original_price": 120.0,
+                        "image": "", "link": url}
+        with mock.patch.object(bot, "extract_product", return_value=product_data), \
+                mock.patch.object(bot, "generate_affiliate_link",
+                                  return_value=("https://meli.la/ok", None)) as gen, \
+                mock.patch.object(bot, "publish", return_value=True) as pub, \
+                mock.patch.object(bot, "send_message"):
+            bot.handle_private_message(message)
+        gen.assert_called_once()
+        pub.assert_called_once()
+        self.assertEqual(pub.call_args[0][0]["affiliate_link"], "https://meli.la/ok")
+
+    def test_private_link_generator_failure_does_not_publish(self):
+        url = "https://www.mercadolivre.com.br/produto/p/MLB2"
+        message = {"chat": {"id": 123, "type": "private"}, "message_id": 10,
+                   "text": url}
+        product_data = {"title": "Fone", "price": 89.9, "original_price": None,
+                        "image": "", "link": url}
+        with mock.patch.object(bot, "extract_product", return_value=product_data), \
+                mock.patch.object(bot, "generate_affiliate_link",
+                                  return_value=(None, "sem login")), \
+                mock.patch.object(bot, "publish") as pub, \
+                mock.patch.object(bot, "notify_link_failure") as notify, \
+                mock.patch.object(bot, "send_message"):
+            bot.handle_private_message(message)
+        pub.assert_not_called()
+        notify.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

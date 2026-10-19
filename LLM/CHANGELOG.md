@@ -5,6 +5,32 @@
 
 ---
 
+## [2026-10-19 11:15] — Sessão 26.1: link no privado publica direto no canal
+
+**Objetivo:** pedido do usuário — ao mandar um link no privado do bot, ele deve
+acessar o link, gerar pelo gerador oficial (ML/Shopee/Amazon) e **publicar no
+canal automaticamente**, sem precisar de `/canal`.
+
+**Arquivos alterados:**
+- `bot.py` — `handle_private_message()` guarda `affiliate_link` no produto e
+  publica direto; `/preco` e `/canal <link>` seguem o mesmo caminho; se o
+  gerador falhar, avisa o admin (`notify_link_failure`) e não publica. `HELP`
+  atualizado.
+- `tests/test_affiliate.py` — 2 testes novos do fluxo privado (publica com link
+  gerado; falha do gerador não publica).
+
+**Análise / o que foi observado:**
+- O fluxo privado já chamava `generate_affiliate_link()` — com o fix da sessão
+  26 o link de loja do ML agora expande/resolve — então faltava apenas publicar.
+- Para não gerar duas vezes, quando `final_link` existe o `publish()` usa
+  `product["affiliate_link"]` direto.
+
+**Resultado:**
+- ✅ 30 testes passando.
+- ⚠️ Pendente: validar no Telegram real (link ML no privado → post no canal).
+
+---
+
 ## [2026-10-19 10:55] — Sessão 26: Shopee pelo portal (produto → "Obter link") + link de loja do canal
 
 **Objetivo:** parar de raspar a busca pública da Shopee (403) e ler as ofertas
