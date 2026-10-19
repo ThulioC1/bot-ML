@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -508,6 +509,129 @@ class InstagramCycleTests(unittest.TestCase):
             bot.instagram_cycle()
         self.assertEqual(post.call_count, 1)
         save.assert_not_called()
+
+
+def _coupon_json(cid="1", status="ACTIVE", **extra):
+    coupon = {
+        "campaign_id": cid,
+        "icon": "https://http2.mlstatic.com/cupom.jpg",
+        "title": {"text": "R$ 20 OFF"},
+        "category": "Loja X",
+        "amount": {"min_amount": "Compra mínima R$ 50",
+                   "cap_amount": "Limite de desconto R$ 20"},
+        "benefit_mode": "FIXED",
+        "action": {"text": "Conferir produtos", "type": "link",
+                   "value": "https://lista.mercadolivre.com.br/_CustId_1"
+                            "?coupon_campaign_id=1"},
+        "status": {"id": status},
+        "expiration_date": "2026-12-31T02:59:59Z",
+        "segmentations": {"has_items": True, "total_items": 10},
+    }
+    coupon.update(extra)
+    return coupon
+
+
+def _coupon_page(coupons):
+    data = {"appProps": {"pageProps": {"floxPreloadedState": {
+        "@meli/web/flox/FLOX_STATE": {"brickStack": {
+            "carousel_1": {"data": {"coupons": coupons}},
+            "carousel_2": {"data": {"coupons": coupons}},
+        }}}}}}
+    return ('<html><body><script id="__NORDIC_RENDERING_CTX__">'
+            "_n.ctx.r=" + json.dumps(data) + ";</script></body></html>")
+
+
+class CupomParserTests(unittest.TestCase):
+    def test_extrai_ativos_e_remove_duplicados(self):
+        coupons = [_coupon_json("1"), _coupon_json("2", status="INACTIVE"),
+                   _coupon_json("1"), _coupon_json("3", category="Loja Y")]
+        found = bot.extract_ml_coupons(_coupon_page(coupons))
+        self.assertEqual([c["id"] for c in found], ["1", "3"])
+        self.assertEqual(found[0]["seller"], "Loja X")
+        self.assertEqual(found[0]["title"], "R$ 20 OFF")
+        self.assertEqual(found[0]["expiration"], "31/12")
+        self.assertEqual(found[0]["min_amount"], "Compra mínima R$ 50")
+        self.assertEqual(found[0]["total_items"], 10)
+        self.assertTrue(found[0]["link"].startswith("https://lista."))
+
+    def test_ignora_cupom_sem_itens(self):
+        coupon = _coupon_json("9", segmentations={"has_items": False})
+        self.assertEqual(bot.extract_ml_coupons(_coupon_page([coupon])), [])
+
+    def test_reserva_pelos_cards_html(self):
+        html = """
+        <article class="smart-coupon smart-coupon--highlight">
+          <p class="smart-coupon-highlight__category">Loja X</p>
+          <span class="smart-coupon-highlight__title-text">R$ 10 OFF</span>
+          <img src="https://img/x.jpg">
+        </article>
+        <article class="smart-coupon smart-coupon--highlight">
+          <span class="smart-coupon-highlight__title-text">sem vendedor</span>
+        </article>
+        """
+        found = bot.extract_ml_coupons(html)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["seller"], "Loja X")
+        self.assertEqual(found[0]["title"], "R$ 10 OFF")
+        self.assertEqual(found[0]["link"], "")
+        self.assertEqual(found[0]["icon"], "https://img/x.jpg")
+
+    def test_pagina_de_erro_nao_quebra(self):
+        self.assertEqual(
+            bot.extract_ml_coupons(
+                "<html>Hubo un error accediendo a esta pagina</html>"), [])
+
+
+class CupomPostTests(unittest.TestCase):
+    def setUp(self):
+        bot.LINK_FAIL_NOTICE.clear()
+
+    def test_publica_com_link_e_botao(self):
+        coupon = bot.extract_ml_coupons(_coupon_page([_coupon_json()]))[0]
+        with mock.patch.object(bot, "generate_affiliate_link",
+                               return_value=("https://meli.la/cupom", None)) as gen, \
+                mock.patch.object(bot, "send_message", return_value=True) as send:
+            ok = bot.post_coupon(coupon)
+        self.assertTrue(ok)
+        gen.assert_called_once()
+        keyboard = send.call_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["url"],
+                         "https://meli.la/cupom")
+        self.assertIn("Loja X", send.call_args[0][0])
+        self.assertIn("R$ 20 OFF", send.call_args[0][0])
+
+    def test_sem_link_nao_publica(self):
+        coupon = bot.extract_ml_coupons(_coupon_page([_coupon_json()]))[0]
+        with mock.patch.object(bot, "generate_affiliate_link",
+                               return_value=(None, "sem login")), \
+                mock.patch.object(bot, "send_message") as send, \
+                mock.patch.object(bot, "notify_admin") as adm:
+            ok = bot.post_coupon(coupon)
+        self.assertFalse(ok)
+        send.assert_not_called()
+        adm.assert_called_once()
+
+
+class CupomCycleTests(unittest.TestCase):
+    def test_envia_so_os_novos_e_grava_estado(self):
+        coupons = bot.extract_ml_coupons(_coupon_page(
+            [_coupon_json("1"), _coupon_json("2")]))
+        page = mock.Mock()
+        page.text = "<html></html>"
+        page.url = bot.ML_COUPONS_URL
+        with mock.patch.object(bot, "browser_get", return_value=page), \
+                mock.patch.object(bot, "extract_ml_coupons",
+                                  return_value=coupons), \
+                mock.patch.object(bot, "load_json",
+                                  return_value={"1": {"at": time.time()}}), \
+                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "post_coupon",
+                                  return_value=True) as post:
+            enviados = bot.cupons_cycle()
+        self.assertEqual(enviados, 1)
+        post.assert_called_once()
+        self.assertEqual(post.call_args[0][0]["id"], "2")
+        self.assertEqual(save.call_args[0][1]["2"]["seller"], "Loja X")
 
 
 if __name__ == "__main__":

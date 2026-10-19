@@ -1,6 +1,23 @@
 # Estado do Projeto
 
-> Última atualização: **2026-10-19 (sessão 26 — Shopee pelo portal + correção do link de loja no canal)**
+> Última atualização: **2026-10-19 (sessão 26.8 — cupons ativos do ML no grupo)**
+
+## 🆕 Sessão 26.8 — Cupons do Mercado Livre (19/10)
+
+O `/diagcupons` capturou o HTML logado real. A fonte útil é
+`https://mercadolivre.com.br/ofertas/cupons`; `/l/promocoes` é landing de
+campanha e não lista cupons. `extract_ml_coupons()` lê o JSON
+`__NORDIC_RENDERING_CTX__` e mantém só `status=ACTIVE` (com reserva pelos cards
+HTML), devolvendo vendedor, desconto, compra mínima, limite, validade, ícone e
+o link `lista.mercadolivre.com.br/...?coupon_campaign_id=...`.
+
+`cupons_cycle()` roda ao fim do `telegram_cycle()` e também no `/cupons`:
+deduplica por `campaign_id` em `cupons_enviados.json` (90 dias), publica até
+`CUPOM_POSTS_PER_CYCLE` (default 3) por ciclo, com `CUPOM_DELAY` (5s) entre
+eles e botão "Ativar cupom" com link de afiliado. Cupom sem link usa a página
+de cupons como destino; se o gerador falhar, não publica e avisa o admin.
+No HTML real: 5 cupons ACTIVE (6 no total). 50 testes passando; falta validar
+no Kali a geração do link da listagem e o post real.
 
 ## 🆕 Sessão 26 — Shopee pelo portal de afiliado (19/10)
 
@@ -32,11 +49,10 @@ como reserva.
 **Busca:** `/buscar <termo>` filtra resultados fora do termo (inclusive os da
 planilha) e ordena por maior desconto / menor preço antes de enviar os 5.
 
-**Cupons ML:** não há API pública; as páginas úteis são `/ofertas/cupons`
-(cupons ativados) e `/l/promocoes` (seção CUPONS, com códigos). O comando
-`/diagcupons` (dono) abre as duas no Chrome logado, salva
-`cupons_debug_<pagina>.html` e envia no privado; o parser será escrito com
-esse HTML real (pendente).
+**Cupons ML:** não há API pública; a página útil é `/ofertas/cupons` (cupons
+ativados). O parser foi implementado na sessão 26.8 (ver acima); o
+`/diagcupons` (dono) continua disponível para recapturar o HTML.
+`/l/promocoes` é landing de campanha e não lista cupons.
 
 **Instagram:** `IG_MIN_DISCOUNT` (default `20`) — a oferta só entra na fila do
 IG se tiver preço antigo e desconto real ≥ 20%. `0` desliga o filtro (posta

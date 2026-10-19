@@ -5,6 +5,44 @@
 
 ---
 
+## [2026-10-19 15:40] — Sessão 26.8: cupons ativos do ML no grupo
+
+**Objetivo:** o dono mandou o HTML real capturado pelo `/diagcupons`; escrever
+o parser dos cupons e publicar os ativos no grupo.
+
+**Arquivos alterados:**
+- `bot.py` — `extract_ml_coupons()` lê o JSON `__NORDIC_RENDERING_CTX__`
+  (com reserva pelos cards `article.smart-coupon`), mantém só `status=ACTIVE`
+  e remove duplicados por `campaign_id`; `coupon_text()`, `post_coupon()` e
+  `cupons_cycle()` (dedup em `cupons_enviados.json`, limite
+  `CUPOM_POSTS_PER_CYCLE`, pausa `CUPOM_DELAY`); `telegram_cycle()` chama o
+  ciclo de cupons; comando `/cupons` no privado; `HELP` atualizado.
+- `tests/test_affiliate.py` — `CupomParserTests` (4), `CupomPostTests` (2) e
+  `CupomCycleTests` (1).
+- `.env.example` — `CUPOM_POSTS_PER_CYCLE=3` e `CUPOM_DELAY=5`.
+
+**Análise / o que foi observado:**
+- O JSON do Nordic traz tudo: `campaign_id`, vendedor (`category`), desconto
+  (`R$ 48 OFF` / `15% OFF`), compra mínima, limite, `action.value` (link
+  `lista.mercadolivre.com.br/_CustId_...?coupon_campaign_id=...`), validade e
+  `segmentations.total_items`. No HTML capturado: **5 cupons ACTIVE de 6**
+  (um `INACTIVE`), todos com link.
+- `/l/promocoes` não trouxe cupons (é a landing de campanha, não a lista);
+  a fonte boa é `/ofertas/cupons`.
+- Cupom sem link (`action.type=button`) usa a página de cupons como destino;
+  se o gerador falhar, ele **não é publicado** e o admin é avisado (mesma
+  regra das ofertas).
+- O estado guarda o `campaign_id` por 90 dias, então reinício não repete cupom
+  já enviado; cupom novo entra até `CUPOM_POSTS_PER_CYCLE` por ciclo.
+
+**Resultado:**
+- ✅ 50 testes passando.
+- ✅ Parser validado com os HTMLs reais do Kali (5 cupons ativos).
+- ⚠️ Falta validar no Kali a geração do link de afiliado para a URL de
+  listagem e o post real no grupo (issue nova).
+
+---
+
 ## [2026-10-19 14:15] — Sessão 26.7: Shopee fora do anti-bot (Open API + detecção)
 
 **Objetivo:** o dono relatou tela de anti-bot na Shopee; contornar sem

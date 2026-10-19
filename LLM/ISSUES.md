@@ -5,6 +5,21 @@
 
 ---
 
+## [ABERTA · 2026-10-19] Cupons do ML: link da listagem e post real no grupo
+
+O parser foi validado com os HTMLs reais (`cupons_debug_ofertas_cupons.html`):
+5 cupons `ACTIVE`, todos com link `lista.mercadolivre.com.br/_CustId_...`.
+Falta validar no Kali:
+
+- `createLink` aceita essa URL de **listagem** (com `coupon_campaign_id` no
+  query) e devolve `meli.la`;
+- o post com ícone, botão "Ativar cupom" e o dedup `cupons_enviados.json`;
+- `/cupons` e o ciclo automático não repetem cupom nem param o ciclo de
+  ofertas se a página cair.
+
+**Como validar:** `python bot.py --login-browser` → `/cupons` → conferir o
+grupo e o arquivo `cupons_enviados.json`.
+
 ## [ABERTA · 2026-10-19] Portal Shopee (product_offer) ainda não rodou AO VIVO
 
 O scraping do portal Shopee e o gerador de link do portal foram validados só

@@ -215,11 +215,16 @@ IG_MIN_DISCOUNT = _num_env("IG_MIN_DISCOUNT", 20)
 IG_POSTS_PER_CYCLE = max(1, int(_num_env("IG_POSTS_PER_CYCLE", 2)))
 IG_POST_DELAY = _num_env("IG_POST_DELAY", 30)
 
+# Cupons do Mercado Livre: quantos posts novos por ciclo e pausa entre eles.
+CUPOM_POSTS_PER_CYCLE = max(1, int(_num_env("CUPOM_POSTS_PER_CYCLE", 3)))
+CUPOM_DELAY = _num_env("CUPOM_DELAY", 5)
+
 SEEN_FILE = BASE_DIR / "seen.json"
 IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
 VITRINE_FILE = BASE_DIR / "vitrine.json"
 OFFSET_FILE = BASE_DIR / "telegram_offset.json"
 STORES_FILE = BASE_DIR / "lojas.json"
+CUPONS_FILE = BASE_DIR / "cupons_enviados.json"
 TEMPLATE_FILE = BASE_DIR / "img" / "template.png"
 
 # Geometria do template, medida em img/template.png (1024x217).
@@ -3198,6 +3203,227 @@ def schedule_instagram(product, title, price, old):
 
 
 # --------------------------------------------------------------------------
+# Cupons do Mercado Livre
+# --------------------------------------------------------------------------
+
+COUPON_LOCK = threading.Lock()
+
+
+def _coupon_expiry(value):
+    if not value:
+        return ""
+    try:
+        return time.strftime("%d/%m", time.strptime(str(value)[:10], "%Y-%m-%d"))
+    except Exception:
+        return str(value)[:10]
+
+
+def _coupon_from_json(raw):
+    """Normaliza um cupom do JSON __NORDIC_RENDERING_CTX__."""
+    if not isinstance(raw, dict):
+        return None
+    if ((raw.get("status") or {}).get("id") or "").upper() != "ACTIVE":
+        return None
+    title = ((raw.get("title") or {}).get("text") or "").strip()
+    seller = (raw.get("category") or "").strip()
+    if not title or not seller:
+        return None
+    seg = raw.get("segmentations") or {}
+    if seg.get("has_items") is False:
+        return None
+    action = raw.get("action") or {}
+    link = action.get("value") if action.get("type") == "link" else ""
+    if not str(link or "").startswith("http"):
+        link = ""
+    amount = raw.get("amount") or {}
+    campaign = str(raw.get("campaign_id") or "").strip()
+    if not campaign:
+        campaign = "cupom_" + hashlib.md5(
+            f"{seller}|{title}|{link}".encode()).hexdigest()[:12]
+    return {
+        "id": campaign,
+        "title": title,
+        "seller": seller,
+        "link": link,
+        "icon": raw.get("icon") or "",
+        "min_amount": (amount.get("min_amount") or "").strip(),
+        "cap_amount": (amount.get("cap_amount") or "").strip(),
+        "benefit_mode": raw.get("benefit_mode") or "",
+        "expiration": _coupon_expiry(raw.get("expiration_date")),
+        "scarcity": ((raw.get("scarcity") or {}).get("text") or "").strip(),
+        "total_items": seg.get("total_items") or 0,
+    }
+
+
+def _coupons_from_cards(html):
+    """Reserva: lê os cards HTML, que não trazem link nem validade."""
+    soup = BeautifulSoup(html, "html.parser")
+    coupons = []
+    for card in soup.select("article.smart-coupon"):
+        seller_el = card.select_one(".smart-coupon-highlight__category")
+        title_el = card.select_one(".smart-coupon-highlight__title-text")
+        if not seller_el or not title_el:
+            continue
+        seller = seller_el.get_text(" ", strip=True)
+        title = title_el.get_text(" ", strip=True)
+        if not seller or not title:
+            continue
+        icon = card.select_one("img")
+        coupons.append({
+            "id": "html_" + hashlib.md5(f"{seller}|{title}".encode()).hexdigest()[:12],
+            "title": title,
+            "seller": seller,
+            "link": "",
+            "icon": (icon.get("src") if icon else "") or "",
+            "min_amount": "",
+            "cap_amount": "",
+            "benefit_mode": "",
+            "expiration": "",
+            "scarcity": "",
+            "total_items": 0,
+        })
+    return coupons
+
+
+def extract_ml_coupons(html):
+    """Cupons ACTIVE da página /ofertas/cupons do Mercado Livre.
+
+    O HTML do ML (Nordic) carrega os cupons completos no JSON
+    __NORDIC_RENDERING_CTX__: campanha, vendedor, mínimo, limite, link e
+    validade. Os cards HTML só servem de reserva.
+    """
+    if not html:
+        return []
+    if "hubo un error accediendo" in html.lower():
+        log("⚠️ Cupons: o ML devolveu a página de erro/bloqueio.")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.find("script", id="__NORDIC_RENDERING_CTX__")
+    coupons = []
+    json_ok = False
+    if script is not None:
+        raw = (script.string or script.get_text() or "").strip()
+        if raw.startswith("_n.ctx.r="):
+            raw = raw[len("_n.ctx.r="):]
+        try:
+            data, _ = json.JSONDecoder().raw_decode(raw)
+        except Exception as exc:
+            log(f"⚠️ Cupons: JSON da página inválido ({type(exc).__name__}).")
+            data = None
+        if data is not None:
+            json_ok = True
+            found = []
+
+            def walk(node):
+                if isinstance(node, dict):
+                    if isinstance(node.get("coupons"), list):
+                        found.extend(node["coupons"])
+                    for value in node.values():
+                        walk(value)
+                elif isinstance(node, list):
+                    for value in node:
+                        walk(value)
+
+            walk(data)
+            for raw_coupon in found:
+                coupon = _coupon_from_json(raw_coupon)
+                if coupon:
+                    coupons.append(coupon)
+
+    if not json_ok:
+        coupons = _coupons_from_cards(html)
+
+    unique, seen = [], set()
+    for coupon in coupons:
+        if coupon["id"] in seen:
+            continue
+        seen.add(coupon["id"])
+        unique.append(coupon)
+    return unique
+
+
+def coupon_text(coupon):
+    lines = ["🎟️ CUPOM MERCADO LIVRE", "",
+             f"🏪 {coupon.get('seller')}",
+             f"💸 {coupon.get('title')}"]
+    if coupon.get("min_amount"):
+        lines.append(f"🛒 {coupon['min_amount']}")
+    if coupon.get("expiration"):
+        lines.append(f"📅 Válido até {coupon['expiration']}")
+    if coupon.get("scarcity"):
+        lines.append(f"⏳ {coupon['scarcity']}")
+    if coupon.get("total_items"):
+        lines.append(f"📦 {coupon['total_items']} produto(s) elegível(is)")
+    return "\n".join(lines)
+
+
+def post_coupon(coupon, chat_id=None):
+    target = coupon.get("link") or ML_COUPONS_URL
+    link, error = generate_affiliate_link(
+        target, None, f"Cupom {coupon.get('seller')} {coupon.get('title')}")
+    if not link:
+        notify_link_failure(target, f"Cupom {coupon.get('seller')}", error)
+        return False
+    keyboard = {"inline_keyboard": [[{"text": "🎟️ Ativar cupom", "url": link}]]}
+    ok = send_message(coupon_text(coupon), chat_id=chat_id,
+                      photo_url=coupon.get("icon") or None, reply_markup=keyboard)
+    if ok:
+        log(f"🎟️ Cupom publicado: {coupon.get('seller')} {coupon.get('title')}")
+    return bool(ok)
+
+
+def cupons_cycle(chat_id=None):
+    """Publica no grupo os cupons ativos que ainda não foram enviados."""
+    with COUPON_LOCK:
+        page = browser_get(ML_COUPONS_URL, wait=6)
+        if page is None:
+            log("⚠️ Cupons: não consegui abrir a página do ML.")
+            return 0
+        html = page.text or ""
+        final_url = getattr(page, "url", "") or ""
+        low = html.lower()
+        if ("login/identification" in final_url.lower()
+                or "digite seu e-mail" in low):
+            log("⚠️ Cupons: a página pediu login — rode --login-browser no Kali.")
+            return 0
+        coupons = extract_ml_coupons(html)
+        if not coupons:
+            log("🎟️ Cupons: nenhum cupom ativo encontrado.")
+            return 0
+
+        state = load_json(CUPONS_FILE, {})
+        limite = time.time() - 90 * 86400
+        for key in list(state):
+            entry = state.get(key) or {}
+            if float(entry.get("at") or 0) < limite:
+                state.pop(key, None)
+
+        novos = [c for c in coupons if c["id"] not in state]
+        if not novos:
+            log(f"🎟️ Cupons: {len(coupons)} ativo(s), nenhum novo.")
+            return 0
+
+        enviados = 0
+        for coupon in novos[:CUPOM_POSTS_PER_CYCLE]:
+            if not post_coupon(coupon, chat_id=chat_id or TELEGRAM_CHAT_ID):
+                log(f"⏭️ Cupom não publicado: {coupon.get('seller')}.")
+                break
+            state[coupon["id"]] = {
+                "seller": coupon.get("seller"),
+                "title": coupon.get("title"),
+                "at": int(time.time()),
+                "exp": coupon.get("expiration", ""),
+            }
+            save_json(CUPONS_FILE, state)
+            enviados += 1
+            if enviados < CUPOM_POSTS_PER_CYCLE and CUPOM_DELAY > 0:
+                time.sleep(CUPOM_DELAY)
+        log(f"🎟️ Cupons: {enviados} novo(s) publicado(s) de {len(coupons)} ativo(s).")
+        return enviados
+
+
+# --------------------------------------------------------------------------
 # Chat privado
 # --------------------------------------------------------------------------
 
@@ -3212,6 +3438,7 @@ HELP = (
     "/canal — publica o último link que você enviou\n"
     "/preco <valor> <link> — monta o post com preço manual\n"
     "/buscar <termo> — busca ofertas do termo (essas sim usam o gerador)\n"
+    "/cupons — busca cupons ativos no ML e publica os novos no grupo\n"
     "/diagcupons — (dono) captura o HTML da página de cupons do ML\n"
     "/lojas — quais lojas do ML o bot está usando\n"
     "/status — diagnóstico das fontes\n"
@@ -3312,6 +3539,18 @@ def handle_private_message(message):
         if falhas:
             texto += f"\n\n⚠️ {falhas} oferta(s) sem link de afiliado foram omitidas."
         send_message(texto, chat_id=chat_id, reply_to=message_id)
+        return
+
+    if text.startswith("/cupons"):
+        send_message("🎟️ Buscando cupons ativos no Mercado Livre...",
+                     chat_id=chat_id, reply_to=message_id)
+        enviados = cupons_cycle()
+        if enviados:
+            resposta = f"✅ {enviados} cupom(ns) novo(s) publicado(s) no grupo."
+        else:
+            resposta = ("ℹ️ Nenhum cupom novo. Se a página pedir login, rode "
+                        "`python bot.py --login-browser` e tente de novo.")
+        send_message(resposta, chat_id=chat_id, reply_to=message_id)
         return
 
     if text.startswith("/diagcupons"):
@@ -3652,6 +3891,11 @@ def telegram_cycle():
             sent += 1
             time.sleep(8)
     log(f"✅ Ciclo concluído: {sent} oferta(s) da raspagem publicada(s).\n")
+
+    try:
+        cupons_cycle()
+    except Exception as exc:
+        log(f"⚠️ Ciclo de cupons: {type(exc).__name__}: {exc}")
 
 
 def instagram_cycle():
