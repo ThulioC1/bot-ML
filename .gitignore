@@ -40,6 +40,20 @@ vitrine.json
 ig_queue.json
 ig_seen.json
 telegram_offset.json
+link_cache.json
+
+# ==========================================================================
+#  PERFIL DE NAVEGADOR — contem cookies de sessao dos portais de afiliado
+# ==========================================================================
+.browser-profile/
+.chrome-cdp/
+cdp_chrome.log
+
+# ==========================================================================
+#  AMBIENTE VIRTUAL
+# ==========================================================================
+.venv/
+venv/
 
 # ==========================================================================
 #  ARQUIVOS GERADOS EM RUNTIME

@@ -5,6 +5,40 @@
 
 ---
 
+## [ABERTA · 2026-10-19] Geradores oficiais nunca rodaram AO VIVO
+
+A Sessão 25 implementou `createLink` (ML), `generateShortLink` (Shopee) e
+`getShortUrl` (Amazon), mas os testes rodaram **só com mocks**. Sem uma sessão
+logada (`python bot.py --login-browser`) não dá para garantir que:
+
+- `POST /affiliate-program/api/v2/affiliates/createLink` continua no ar e aceita
+  `{"urls":[url],"tag":tag}` (e que o `_csrf` do cookie/meta é o exigido);
+- o SiteStripe continua em `/associates/sitestripe/getShortUrl` e aceita
+  `marketplaceId=A2Q3Y263D00KWC`;
+- o DOM de fallback (`#P0-2`, `#amzn-ss-get-link-button`) não mudou;
+- a Open API da Shopee aceita a assinatura como implementada (o teste confere
+  contra SHA256 manual, mas não contra o servidor).
+
+**Como validar:** `python bot.py --login-browser` (logar nos 3 portais) →
+subir o bot → publicar uma oferta de cada loja → `/status` mostra o estado dos
+geradores (`GENERATOR_STATE`).
+
+## [ABERTA · 2026-10-19] Login do navegador não roda no Termux (headless)
+
+O perfil persistente (`.browser-profile`) exige tela para o login interativo.
+No Android/Termux o CDP até avalia JS, mas sem os cookies de sessão dos portais
+os geradores ML/Amazon falham — e a oferta **não é publicada** (comportamento
+proposital: melhor não postar do que postar sem comissão). Opções: copiar o
+perfil do PC para o Termux, ou aceitar que no Android só a Shopee (Open API)
+gera link.
+
+## [RESOLVIDA · 2026-10-19] Roteador confundia magazineluiza.com.br com a Amazon
+
+O teste do roteador pegou: `"a.co" in url` casa com `magazineluiza.com.br`.
+A loja agora é decidida **pelo host** em `_store_of_url()` — e o teste
+`test_router_unsupported_store` garante que Magazine Luiza devolve o link
+original, sem gerador.
+
 ## [RESOLVIDA · 2026-10-15] Botão do Telegram quebrou o envio de fotos
 
 **Sintoma:** depois da Sessão 22, o Telegram parou de aceitar as fotos. O texto

@@ -76,6 +76,54 @@ ML_MATT_TOOL = env("ML_MATT_TOOL") or env("ML_AFFILIATE_TOOL_ID")
 SHOPEE_TAG = env("SHOPEE_TAG") or env("SHOPEE_AFFILIATE_ID")
 AMAZON_TAG = env("AMAZON_TAG")
 
+# --- Geradores oficiais de link de afiliado --------------------------------
+# O link publicado agora e SEMPRE o link curto produzido pelo gerador oficial
+# de cada loja. O bot nao acrescenta mais ?tag / ?matt_word na URL.
+#
+# ML      : POST /affiliate-program/api/v2/affiliates/createLink (sessao do
+#           navegador persistente + etiqueta da conta)
+# Shopee  : Open API oficial generateShortLink (App ID + Secret)
+# Amazon  : SiteStripe /associates/sitestripe/getShortUrl (sessao do navegador)
+ML_AFFILIATE_TAG = (
+    env("ML_AFFILIATE_TAG")
+    or ML_MATT_WORD
+    or env("ML_AFFILIATE_USERNAME")
+    or env("ML_AFFILIATE")
+)
+SHOPEE_APP_ID = env("SHOPEE_APP_ID")
+SHOPEE_SECRET = env("SHOPEE_SECRET")
+SHOPEE_API_URL = "https://open-api.affiliate.shopee.com.br/graphql"
+AMAZON_MARKETPLACE_ID = env("AMAZON_MARKETPLACE_ID", "A2Q3Y263D00KWC")
+
+# Pastas persistentes: o login feito uma vez em cada portal fica salvo aqui.
+_PROFILE_ENV = env("BROWSER_PROFILE_DIR")
+BROWSER_PROFILE_DIR = Path(_PROFILE_ENV) if _PROFILE_ENV else (BASE_DIR / ".browser-profile")
+if not BROWSER_PROFILE_DIR.is_absolute():
+    BROWSER_PROFILE_DIR = BASE_DIR / BROWSER_PROFILE_DIR
+BROWSER_SCRAPING = env("BROWSER_SCRAPING", "1").strip().lower() not in ("0", "false", "nao", "não")
+try:
+    LINK_GEN_TIMEOUT = max(15, int(env("LINK_GEN_TIMEOUT", "60") or 60))
+except ValueError:
+    LINK_GEN_TIMEOUT = 60
+LINK_GEN_CACHE_FILE = BASE_DIR / "link_cache.json"
+LINK_GEN_CACHE_TTL = 6 * 3600
+
+ML_LINKBUILDER_URL = "https://www.mercadolivre.com.br/afiliados/linkbuilder"
+SHOPEE_AFFILIATE_URL = "https://affiliate.shopee.com.br/"
+AMAZON_HOME_URL = "https://www.amazon.com.br/"
+GENERATOR_STATE = {
+    "ml": {"ok": None, "msg": "não usado ainda"},
+    "shopee": {"ok": None, "msg": "não usado ainda"},
+    "amazon": {"ok": None, "msg": "não usado ainda"},
+}
+
+
+def generator_label(store):
+    state = GENERATOR_STATE.get(store) or {}
+    if state.get("ok") is True:
+        return "OK"
+    return "falha" if state.get("ok") is False else "não testado"
+
 FOOTER_TEXT = env("FOOTER", "Gostou da oferta? Compartilhe nosso grupo: https://t.me/vagantepromo")
 
 SHEET_CSV_URL = env(
@@ -457,7 +505,7 @@ def store_catalog(store_url):
     if cached and time.time() - cached[0] < 300:
         return cached[1]
 
-    resp = http_get(store_url, timeout=25)
+    resp = browser_get(store_url, wait=2)
     items = []
     if resp is not None and resp.status_code == 200 and not _is_bot_wall(resp.text[:3000]):
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -567,63 +615,425 @@ def is_product_url(url):
     return any(domain in url.lower() for domain in MARKETPLACES)
 
 
-def affiliate_link(url, price=None, title=None):
-    """Aplica o identificador de afiliado conforme o marketplace.
+SHORT_LINK_RE = re.compile(
+    r"https?://(?:meli\.la|mercadolivre\.com(?:\.br)?/sec|shope\.ee|"
+    r"s\.shopee\.com(?:\.br)?|amzn\.to|a\.co)/[^\s\"'<>\\]+",
+    re.I,
+)
+AMAZON_ASIN_RE = re.compile(r"/(?:dp|gp/product|gp/aw/d|d)/([A-Z0-9]{10})", re.I)
 
-    Devolve (link, aviso). O aviso e preenchido quando o link foi expandido
-    mas aponta para uma LOJA — que ignora a tag de afiliado, ou seja, nao
-    gera comissao. Nesse caso `link` vem sem tag para naoIludir ninguem.
+
+def _short_link_from_text(text):
+    if not text:
+        return ""
+    text = str(text).replace("\\/", "/")
+    match = SHORT_LINK_RE.search(text)
+    return match.group(0).rstrip(".,);") if match else ""
+
+
+def _extract_short_link(payload):
+    """Procura um link curto de afiliado em qualquer lugar da resposta."""
+    if isinstance(payload, dict):
+        for key in ("shortUrl", "short_url", "shortLink", "short_link",
+                    "link", "url", "permalink"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                found = _short_link_from_text(value)
+                if found:
+                    return found
+        for value in payload.values():
+            found = _extract_short_link(value)
+            if found:
+                return found
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            found = _extract_short_link(value)
+            if found:
+                return found
+    elif isinstance(payload, str):
+        return _short_link_from_text(payload)
+    return ""
+
+
+def _normalize_affiliate_url(url, store):
+    expanded = expand_url(url)
+    if expanded and expanded != url:
+        url = expanded
+    if store == "ml":
+        return strip_params(url, list(ML_OWN_TAGS))
+    if store == "shopee":
+        return strip_params(url, list(SHOPEE_OWN_TAGS))
+    if store == "amazon":
+        return strip_params(url, list(AMAZON_OWN_TAGS))
+    return url
+
+
+def _is_short_affiliate_url(url):
+    return bool(re.match(
+        r"https?://(?:meli\.la|shope\.ee|s\.shopee\.com(?:\.br)?|amzn\.to|a\.co)/",
+        url or "", re.I))
+
+
+def _short_input_error(store, url):
+    if not _is_short_affiliate_url(url):
+        return None
+    msg = (f"não foi possível expandir o link curto de origem ({url[:60]}) "
+           f"— gere o link a partir da URL do produto")
+    _set_generator_state(store, False, msg)
+    return None, msg
+
+
+def _link_cache_get(key):
+    cache = load_json(LINK_GEN_CACHE_FILE, {})
+    entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return ""
+    try:
+        fresh = time.time() - float(entry.get("ts", 0)) < LINK_GEN_CACHE_TTL
+    except (TypeError, ValueError):
+        fresh = False
+    link = entry.get("link") if fresh else ""
+    return link if isinstance(link, str) else ""
+
+
+def _link_cache_set(key, link):
+    cache = load_json(LINK_GEN_CACHE_FILE, {})
+    cache[key] = {"link": link, "ts": int(time.time())}
+    if len(cache) > 300:
+        for old in list(cache)[:-300]:
+            cache.pop(old, None)
+    save_json(LINK_GEN_CACHE_FILE, cache)
+
+
+def _set_generator_state(store, ok, msg):
+    GENERATOR_STATE[store] = {"ok": ok, "msg": msg[:300]}
+
+
+def _ml_dom_link(url):
+    script = r"""
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const scan = () => {
+      for (const node of document.querySelectorAll('textarea, input')) {
+        const val = (node.value || '').trim();
+        if (/meli\.la|mercadolivre\.com.*\/sec\//.test(val)) return val;
+      }
+      for (const a of document.querySelectorAll('a[href]')) {
+        if (/meli\.la|mercadolivre\.com.*\/sec\//.test(a.href)) return a.href;
+      }
+      return '';
+    };
+    let link = scan();
+    if (!link) {
+      const btn = document.querySelector(
+        '#P0-2, [data-testid="affiliate-link"], button[aria-label*="afiliad" i]');
+      if (btn) {
+        btn.click();
+        await sleep(2500);
+        link = scan();
+      }
+    }
+    return link;
     """
+    result = browser_eval(url, script, wait=3, timeout=LINK_GEN_TIMEOUT,
+                          await_promise=True)
+    if not result or not result.get("ok"):
+        return ""
+    return _short_link_from_text(result.get("value"))
+
+
+def generate_ml_affiliate_link(url):
+    """Gera o link curto no portal de afiliados do Mercado Livre."""
+    if not ML_AFFILIATE_TAG:
+        msg = "ML_AFFILIATE_TAG/ML_MATT_WORD ausente no .env"
+        _set_generator_state("ml", False, msg)
+        return None, msg
+    url = _normalize_affiliate_url(url, "ml")
+    short_error = _short_input_error("ml", url)
+    if short_error:
+        return short_error
+    if is_store_link(url):
+        msg = f"link de LOJA do ML ({urllib.parse.urlparse(url).path}) não gera comissão"
+        _set_generator_state("ml", False, msg)
+        return None, msg
+
+    script = """
+    const target = %s;
+    const tag = %s;
+    const meta = document.querySelector('meta[name="csrf-token"], meta[name="_csrf"]');
+    const cookie = (document.cookie.match(/(?:^|; )_csrf=([^;]+)/) || [])[1] || '';
+    const csrf = (meta && meta.content) || decodeURIComponent(cookie);
+    const endpoint = 'https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink';
+    const attempts = [];
+    const bodies = [
+      {urls: [target], tag: tag},
+      {url: target, tag: tag}
+    ];
+    for (const body of bodies) {
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'x-csrf-token': csrf
+          },
+          body: JSON.stringify(body)
+        });
+        const text = await resp.text();
+        attempts.push({status: resp.status, text: text.slice(0, 5000)});
+        if (resp.ok) return {ok: true, attempts: attempts};
+      } catch (e) {
+        attempts.push({status: 0, text: String(e)});
+      }
+    }
+    return {ok: false, attempts: attempts};
+    """ % (json.dumps(url, ensure_ascii=False), json.dumps(ML_AFFILIATE_TAG))
+
+    result = browser_eval(ML_LINKBUILDER_URL, script, wait=2,
+                          timeout=LINK_GEN_TIMEOUT, await_promise=True)
+    if result and result.get("ok"):
+        value = result.get("value")
+        link = _extract_short_link(value)
+        if link:
+            _set_generator_state("ml", True, f"link gerado para {url[:60]}")
+            return link, None
+        detail = ""
+        if isinstance(value, dict) and value.get("attempts"):
+            try:
+                detail = str(value["attempts"][0].get("text", ""))[:200]
+            except Exception:
+                detail = ""
+        msg = f"createLink não devolveu link curto {detail}".strip()
+    else:
+        msg = (result or {}).get("error") or "navegador indisponível"
+
+    link = _ml_dom_link(url)
+    if link:
+        _set_generator_state("ml", True, "link gerado pela pagina do produto")
+        return link, None
+    _set_generator_state("ml", False, msg)
+    return None, f"ML: {msg}"
+
+
+def _shopee_authorization(body, timestamp=None):
+    """Header Authorization da Open API (SHA256 appId+ts+body+secret)."""
+    timestamp = int(timestamp or time.time())
+    raw_signature = f"{SHOPEE_APP_ID}{timestamp}{body}{SHOPEE_SECRET}"
+    signature = hashlib.sha256(raw_signature.encode("utf-8")).hexdigest()
+    header = (f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={timestamp}, "
+              f"Signature={signature}")
+    return timestamp, header
+
+
+def generate_shopee_affiliate_link(url):
+    """Gera o link curto pela Open API oficial da Shopee."""
+    if not SHOPEE_APP_ID or not SHOPEE_SECRET:
+        msg = "SHOPEE_APP_ID/SHOPEE_SECRET ausentes no .env"
+        _set_generator_state("shopee", False, msg)
+        return None, msg
+    url = _normalize_affiliate_url(url, "shopee")
+    short_error = _short_input_error("shopee", url)
+    if short_error:
+        return short_error
+    query = ('mutation { generateShortLink(input: {originUrl: "%s"}) '
+             '{ shortLink } }' % url.replace('"', '\\"'))
+    body = json.dumps({"query": query}, ensure_ascii=False, separators=(",", ":"))
+    _, authorization = _shopee_authorization(body)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": authorization,
+    }
+    try:
+        resp = requests.post(SHOPEE_API_URL, data=body.encode("utf-8"),
+                             headers=headers, timeout=LINK_GEN_TIMEOUT)
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        _set_generator_state("shopee", False, msg)
+        return None, f"Shopee: {msg}"
+    if resp.status_code != 200:
+        msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        _set_generator_state("shopee", False, msg)
+        return None, f"Shopee: {msg}"
+    try:
+        data = resp.json()
+    except Exception:
+        data = resp.text
+    link = _extract_short_link(data)
+    if link:
+        _set_generator_state("shopee", True, f"link gerado para {url[:60]}")
+        return link, None
+    msg = f"resposta sem shortLink: {str(data)[:200]}"
+    _set_generator_state("shopee", False, msg)
+    return None, f"Shopee: {msg}"
+
+
+def _amazon_asin(url):
+    match = AMAZON_ASIN_RE.search(url or "")
+    if match:
+        return match.group(1).upper()
+    match = re.search(r"[?&]asin=([A-Z0-9]{10})", url or "", re.I)
+    return match.group(1).upper() if match else ""
+
+
+def _amazon_dom_link(url):
+    script = r"""
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const scan = () => {
+      for (const node of document.querySelectorAll(
+          '#amzn-ss-text-shortlink-textarea, #amzn-ss-shortlink-textarea, textarea, input')) {
+        const val = (node.value || '').trim();
+        if (/amzn\.to|a\.co/.test(val)) return val;
+      }
+      for (const a of document.querySelectorAll('a[href]')) {
+        if (/amzn\.to|a\.co/.test(a.href)) return a.href;
+      }
+      return '';
+    };
+    let link = scan();
+    if (!link) {
+      const btn = document.querySelector(
+        '#amzn-ss-get-link-button, #amzn-ss-text-link, [data-action="ss-get-link"]');
+      if (btn) {
+        btn.click();
+        await sleep(2500);
+        link = scan();
+      }
+    }
+    return link;
+    """
+    result = browser_eval(url, script, wait=4, timeout=LINK_GEN_TIMEOUT,
+                          await_promise=True)
+    if not result or not result.get("ok"):
+        return ""
+    return _short_link_from_text(result.get("value"))
+
+
+def generate_amazon_affiliate_link(url):
+    """Gera o link curto no SiteStripe da Amazon."""
+    if not AMAZON_TAG:
+        msg = "AMAZON_TAG ausente no .env"
+        _set_generator_state("amazon", False, msg)
+        return None, msg
+    url = _normalize_affiliate_url(url, "amazon")
+    short_error = _short_input_error("amazon", url)
+    if short_error:
+        return short_error
+    asin = _amazon_asin(url)
+    canonical = f"https://www.amazon.com.br/dp/{asin}" if asin else url
+
+    script = """
+    const target = %s;
+    const tag = %s;
+    const mids = %s;
+    const longUrl = target + '?tag=' + encodeURIComponent(tag)
+      + '&linkCode=sl1&ref_=as_li_ss_tl';
+    const attempts = [];
+    for (const mid of mids) {
+      const endpoint = '/associates/sitestripe/getShortUrl?longUrl='
+        + encodeURIComponent(longUrl)
+        + '&tag=' + encodeURIComponent(tag)
+        + '&marketplaceId=' + encodeURIComponent(mid);
+      try {
+        const resp = await fetch(endpoint, {
+          credentials: 'include',
+          headers: {'Accept': 'application/json, text/plain, */*'}
+        });
+        const text = await resp.text();
+        attempts.push({status: resp.status, mid: mid, text: text.slice(0, 5000)});
+        if (resp.ok && (/amzn\\.to|a\\.co/.test(text))) {
+          return {ok: true, attempts: attempts};
+        }
+      } catch (e) {
+        attempts.push({status: 0, mid: mid, text: String(e)});
+      }
+    }
+    return {ok: false, attempts: attempts};
+    """ % (json.dumps(canonical, ensure_ascii=False),
+           json.dumps(AMAZON_TAG),
+           json.dumps([AMAZON_MARKETPLACE_ID, "526970", "12", ""]))
+
+    result = browser_eval(AMAZON_HOME_URL, script, wait=2,
+                          timeout=LINK_GEN_TIMEOUT, await_promise=True)
+    if result and result.get("ok"):
+        value = result.get("value")
+        link = _extract_short_link(value)
+        if link:
+            _set_generator_state("amazon", True, f"link gerado para {canonical[:60]}")
+            return link, None
+        detail = ""
+        if isinstance(value, dict) and value.get("attempts"):
+            try:
+                detail = str(value["attempts"][0].get("text", ""))[:200]
+            except Exception:
+                detail = ""
+        msg = f"getShortUrl não devolveu link curto {detail}".strip()
+    else:
+        msg = (result or {}).get("error") or "navegador indisponível"
+
+    link = _amazon_dom_link(canonical)
+    if link:
+        _set_generator_state("amazon", True, "link gerado pela pagina do produto")
+        return link, None
+    _set_generator_state("amazon", False, msg)
+    return None, f"Amazon: {msg}"
+
+
+def _store_of_url(url):
+    """Loja dona do link, olhando só o HOST (evita 'a.co' dentro de magazineluiza.com)."""
+    host = urllib.parse.urlparse(url or "").netloc.lower()
+    host = host.split("@")[-1].split(":")[0]
+    if "meli.la" in host or "mercadolivre" in host or "mercadolibre" in host:
+        return "ml"
+    if "shopee" in host or "shope.ee" in host:
+        return "shopee"
+    if "amazon" in host or "amzn.to" in host or host == "a.co" or host.endswith(".a.co"):
+        return "amazon"
+    return ""
+
+
+def generate_affiliate_link(url, price=None, title=None):
+    """Devolve (link_curto, erro). Nunca inventa um link com ?tag."""
     if not url:
-        return url, ""
+        return None, "URL vazia"
     url = url.rstrip(".,)")
-    low = url.lower()
-    aviso = ""
+    store = _store_of_url(url)
 
-    # ---- Mercado Livre (inclui meli.la, amzn-like encurtado) ----
-    if "meli.la" in low or "mercadolivre" in low or "mercadolibre" in low:
-        tracking = ({"matt_word": ML_MATT_WORD, "matt_tool": ML_MATT_TOOL}
-                    if (ML_MATT_WORD and ML_MATT_TOOL) else {})
-        expanded = expand_url(url)
-        if expanded != url:
-            url = expanded
-            low = url.lower()
-        # tira a tag de afiliado de quem ja tinha sharing o link
-        url = strip_params(url, list(ML_OWN_TAGS))
-        low = url.lower()
+    if store == "ml":
+        generator = generate_ml_affiliate_link
+    elif store == "shopee":
+        generator = generate_shopee_affiliate_link
+    elif store == "amazon":
+        generator = generate_amazon_affiliate_link
+    else:
+        return url, None
 
-        if is_store_link(url):
-            item = resolve_store_link(url, price, title)
-            if item:
-                return append_query(item["url"], tracking), ""
-            aviso = (f"⛔ link de LOJA do ML ({urllib.parse.urlparse(url).path}) "
-                     f"ignora a tag de afiliado — nao gera comissao sua.")
-            return url, aviso
-        if not tracking:
-            return url, "⛔ ML_MATT_WORD/ML_MATT_TOOL ausentes no .env."
-        return append_query(url, tracking), aviso
+    cache_key = f"{store}:{url}"
+    cached = _link_cache_get(cache_key)
+    if cached:
+        return cached, None
 
-    # ---- Shopee (inclui shope.ee / s.shopee.com) ----
-    if "shopee" in low or "shope.ee" in low:
-        expanded = expand_url(url)
-        if expanded != url:
-            url = expanded
-        url = strip_params(url, list(SHOPEE_OWN_TAGS))
-        if not SHOPEE_TAG:
-            return url, "⛔ SHOPEE_TAG ausente no .env."
-        return append_query(url, {"smtt": SHOPEE_TAG}), aviso
+    if store == "ml" and is_store_link(url):
+        item = resolve_store_link(url, price, title)
+        if not item:
+            msg = (f"link de LOJA do ML ({urllib.parse.urlparse(url).path}) "
+                   f"sem produto equivalente — não gera comissão")
+            _set_generator_state("ml", False, msg)
+            return None, msg
+        url = item["url"]
 
-    # ---- Amazon (inclui amzn.to / a.co) ----
-    if "amazon" in low or "amzn.to" in low or "a.co" in low:
-        expanded = expand_url(url)
-        if expanded != url:
-            url = expanded
-        url = strip_params(url, list(AMAZON_OWN_TAGS))
-        if not AMAZON_TAG:
-            return url, "⛔ AMAZON_TAG ausente no .env."
-        return append_query(url, {"tag": AMAZON_TAG}), aviso
+    link, error = generator(url)
+    if link:
+        _link_cache_set(cache_key, link)
+        return link, None
+    return None, error or f"{store}: falha ao gerar o link"
 
-    return url, aviso
+
+def affiliate_link(url, price=None, title=None):
+    """Compatibilidade: devolve (link, aviso). `link` é None quando falhou."""
+    link, error = generate_affiliate_link(url, price, title)
+    return link, error or ""
 
 
 # --------------------------------------------------------------------------
@@ -1295,13 +1705,24 @@ def fetch_sheet_products():
     return products
 
 
-def selenium_driver():
-    """Sobe um Chrome FORA DA TELA. Sem janela o ML devolve a parede anti-bot."""
+def selenium_driver(visible=False):
+    """Sobe um Chrome com PERFIL PERSISTENTE. Sem janela o ML devolve a parede.
+
+    O perfil fica em BROWSER_PROFILE_DIR: o login feito uma vez nos portais de
+    afiliado (ML, Shopee e Amazon) e reaproveitado nas execucoes seguintes.
+    `visible=True` abre a janela na tela para o usuario fazer o login.
+    """
     global _DRIVER
-    if not USE_SELENIUM:
+    if not USE_SELENIUM and not visible:
         return None
     with _DRIVER_LOCK:
         if _DRIVER is not None:
+            if visible:
+                try:
+                    _DRIVER.set_window_position(40, 40)
+                    _DRIVER.maximize_window()
+                except Exception:
+                    pass
             return _DRIVER
         try:
             from selenium import webdriver
@@ -1311,29 +1732,100 @@ def selenium_driver():
             log(f"⚠️ Selenium: {SELENIUM_STATE['msg']}. Seguindo so com requests.")
             return None
         try:
+            BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
             opts = Options()
-            if SELENIUM_HEADLESS:
+            if SELENIUM_HEADLESS and not visible:
                 opts.add_argument("--headless=new")
             opts.add_argument("--lang=pt-BR")
             opts.add_argument("--window-size=1400,1000")
-            opts.add_argument("--window-position=-32000,-32000")  # real, so fora da vista
+            # Perfil fixo: sem isso o Selenium cria um perfil temporario a cada
+            # execucao e o login dos portais de afiliado se perde.
+            opts.add_argument(f"--user-data-dir={BROWSER_PROFILE_DIR}")
+            opts.add_argument("--profile-directory=Default")
+            if visible:
+                opts.add_argument("--start-maximized")
+                opts.add_argument("--window-position=40,40")
+            else:
+                opts.add_argument("--window-position=-32000,-32000")  # real, so fora da vista
             opts.add_argument("--disable-blink-features=AutomationControlled")
             opts.add_argument("--no-first-run")
             opts.add_argument("--no-default-browser-check")
             opts.add_experimental_option("excludeSwitches", ["enable-automation",
                                                              "useAutomationExtension"])
             opts.add_experimental_option("useAutomationExtension", False)
-            _DRIVER = webdriver.Chrome(options=opts)
-            _DRIVER.set_page_load_timeout(45)
+            driver = webdriver.Chrome(options=opts)
+            driver.set_page_load_timeout(max(45, LINK_GEN_TIMEOUT))
+            if not visible:
+                _DRIVER = driver
             SELENIUM_STATE["ok"] = True
             SELENIUM_STATE["msg"] = "Chrome ativo"
-            log("✅ Chrome (Selenium) iniciado — o Mercado Livre volta a responder.")
-            return _DRIVER
+            log(f"✅ Chrome (Selenium) iniciado — perfil: {BROWSER_PROFILE_DIR.name}")
+            return driver
         except Exception as exc:
             SELENIUM_STATE["ok"] = False
             SELENIUM_STATE["msg"] = f"falhou ({type(exc).__name__})"
             log(f"⚠️ Selenium: {SELENIUM_STATE['msg']}. Seguindo so com requests.")
             return None
+
+
+def quit_driver():
+    """Fecha o Chrome compartilhado (usado antes do modo de login)."""
+    global _DRIVER
+    with _DRIVER_LOCK:
+        if _DRIVER is not None:
+            try:
+                _DRIVER.quit()
+            except Exception:
+                pass
+            _DRIVER = None
+
+
+def browser_login_session():
+    """Abre os 3 portais de afiliado para o usuario logar uma unica vez.
+
+    Uso: python bot.py --login-browser
+    O perfil e o mesmo usado na operacao normal, entao o login persiste.
+    """
+    if IS_ANDROID:
+        log("⚠️ O login pelo navegador precisa de um ambiente com tela. "
+            "No Termux use um perfil ja autenticado ou o cookie no .env.")
+        return
+    if not USE_SELENIUM:
+        log("⚠️ USE_SELENIUM=0 — o gerador de links do ML/Amazon precisa do Chrome.")
+        return
+    quit_driver()
+    driver = selenium_driver(visible=True)
+    if driver is None:
+        log("⚠️ Não foi possível abrir o Chrome para o login.")
+        return
+    portais = [
+        ("Mercado Livre Afiliados", ML_LINKBUILDER_URL),
+        ("Shopee Afiliados", SHOPEE_AFFILIATE_URL),
+        ("Amazon Associados", AMAZON_HOME_URL),
+    ]
+    log("🔐 Abrindo os portais de afiliado. Faça login em cada aba.")
+    for nome, url in portais:
+        try:
+            if driver.current_url == "data:,":
+                driver.get(url)
+            else:
+                driver.execute_script("window.open(arguments[0], '_blank');", url)
+            log(f"   • {nome}: {url}")
+        except Exception as exc:
+            log(f"   ⚠️ {nome}: {type(exc).__name__}")
+    log("Quando terminar, volte ao terminal e pressione ENTER para fechar o Chrome.")
+    try:
+        input()
+    except Exception:
+        try:
+            time.sleep(600)
+        except Exception:
+            pass
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    log("🔒 Chrome de login fechado. O perfil está salvo.")
 
 
 class _Page:
@@ -1364,6 +1856,40 @@ def selenium_get(url, wait=3, timeout=45):
         except Exception as exc:
             log(f"⚠️ Selenium: {type(exc).__name__}: {exc}")
             return None
+
+
+def selenium_eval(url, script, wait=3, timeout=None, await_promise=True):
+    """Navega e executa JavaScript no Chrome real.
+
+    Devolve {"ok": True, "value": ...} ou {"ok": False, "error": "..."}.
+    `script` pode usar await quando await_promise=True.
+    """
+    driver = selenium_driver()
+    if driver is None:
+        return None
+    timeout = timeout or LINK_GEN_TIMEOUT
+    with _DRIVER_LOCK:
+        try:
+            driver.get(url)
+            if wait:
+                time.sleep(wait)
+            driver.set_script_timeout(max(10, timeout))
+            if await_promise:
+                wrapper = (
+                    "const done = arguments[arguments.length - 1];"
+                    "(async () => {"
+                    "  try {"
+                    "    const value = await (async () => {" + script + "})();"
+                    "    done({ok: true, value: value});"
+                    "  } catch (e) { done({ok: false, error: String(e)}); }"
+                    "})();"
+                )
+                raw = driver.execute_async_script(wrapper)
+            else:
+                raw = driver.execute_script(script)
+            return {"ok": True, "value": raw}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 def chromium_candidates():
     """Binarios do Chromium em ordem de preferencia, com duplicados removidos."""
@@ -1513,26 +2039,13 @@ def cdp_server():
     return None
 
 
-def cdp_get(url, wait=None, timeout=90):
-    """Baixa a pagina por CDP e devolve o HTML renderizado, ou None.
-
-    Passos: abre uma aba -> espera o JS rodar -> le document.outerHTML.
-    Nunca levanta excecao: devolve None e o ciclo segue com /social/<loja>.
-    """
-    try:
-        return _cdp_get(url, wait, timeout)
-    except Exception as exc:
-        log(f"⚠️ CDP falhou em {url[:55]}: {type(exc).__name__}: {exc}")
-        _CDP["msg"] = f"{type(exc).__name__}"
-        return None
-
-
-def _cdp_get(url, wait=None, timeout=90):
+def _cdp_open(url, wait=None, timeout=90):
+    """Abre uma aba no Chromium, navega e devolve o WebSocket pronto."""
     try:
         import websocket  # websocket-client (python puro, instala no Termux)
     except Exception:
         _CDP["msg"] = "websocket-client ausente (pip install websocket-client)"
-        log(f"⚠️ CDP: {_CDP['msg']} — /ofertas indisponível, usando /social/<loja>.")
+        log(f"⚠️ CDP: {_CDP['msg']} — recurso de navegador indisponível.")
         return None
 
     base = cdp_server()
@@ -1553,10 +2066,10 @@ def _cdp_get(url, wait=None, timeout=90):
         log("⚠️ CDP: resposta inesperada ao abrir aba.")
         return None
 
-    ws_url = target["webSocketDebuggerUrl"]
     try:
-        ws = websocket.create_connection(ws_url, timeout=timeout,
-                                         origin=f"http://{CDP_HOST}:{CDP_PORT}")
+        ws = websocket.create_connection(
+            target["webSocketDebuggerUrl"], timeout=timeout,
+            origin=f"http://{CDP_HOST}:{CDP_PORT}")
     except Exception as exc:
         log(f"⚠️ CDP: WebSocket falhou ({type(exc).__name__}). "
             f"Verifique se o Chromium subiu com --remote-allow-origins=*")
@@ -1566,8 +2079,6 @@ def _cdp_get(url, wait=None, timeout=90):
         ws.send(json.dumps({"id": 1, "method": "Page.enable"}))
         ws.send(json.dumps({"id": 2, "method": "Page.navigate",
                             "params": {"url": url}}))
-
-        # Espera o load: o evaluate so faz sentido depois que a pagina montou.
         loaded = False
         deadline = time.time() + timeout
         while time.time() < deadline and not loaded:
@@ -1579,41 +2090,110 @@ def _cdp_get(url, wait=None, timeout=90):
             if msg.get("method") == "Page.loadEventFired":
                 loaded = True
         time.sleep(max(wait, 0))               # deixa o JS de listagem montar
+        return ws
+    except Exception as exc:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        log(f"⚠️ CDP: falha ao navegar em {url[:55]} ({type(exc).__name__})")
+        return None
 
-        ws.send(json.dumps({
-            "id": 3, "method": "Runtime.evaluate",
-            "params": {"expression": "document.documentElement.outerHTML",
-                       "returnByValue": True},
-        }))
-        html, deadline = None, time.time() + 45
-        while time.time() < deadline:
-            try:
-                ws.settimeout(10)
-                raw = ws.recv()
-            except Exception:
-                continue                      # segue tentando ate o deadline
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            if msg.get("id") == 3:
-                value = ((msg.get("result") or {}).get("result") or {}).get("value")
-                if value:
-                    html = value
-                break
-        html = value or ""
+
+def _cdp_evaluate(ws, expression, await_promise=False, timeout=60):
+    """Runtime.evaluate no WebSocket já aberto. Devolve o valor bruto."""
+    if await_promise:
+        expression = f"(async () => {{ {expression} }})()"
+    eval_id = int(time.time() * 1000) % 1000000 + 3
+    ws.send(json.dumps({
+        "id": eval_id, "method": "Runtime.evaluate",
+        "params": {"expression": expression, "returnByValue": True,
+                   "awaitPromise": bool(await_promise)},
+    }))
+    deadline = time.time() + max(10, timeout)
+    while time.time() < deadline:
+        try:
+            ws.settimeout(10)
+            raw = ws.recv()
+        except Exception:
+            continue
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        if msg.get("id") != eval_id:
+            continue
+        result = msg.get("result") or {}
+        if result.get("exceptionDetails"):
+            detail = result["exceptionDetails"]
+            text = ((detail.get("exception") or {}).get("description")
+                    or detail.get("text") or "erro de JavaScript")
+            raise RuntimeError(text[:300])
+        return (result.get("result") or {}).get("value")
+    raise TimeoutError("Runtime.evaluate não respondeu")
+
+
+def cdp_get(url, wait=None, timeout=90):
+    """Baixa a pagina por CDP e devolve o HTML renderizado, ou None."""
+    ws = _cdp_open(url, wait, timeout)
+    if ws is None:
+        return None
+    try:
+        html = _cdp_evaluate(ws, "document.documentElement.outerHTML",
+                             await_promise=False, timeout=45) or ""
         if _is_bot_wall(html[:2500]):
-            log(f"⚠️ CDP: o ML bloqueou o Chromium em {url[:55]}")
+            log(f"⚠️ CDP: o site bloqueou o Chromium em {url[:55]}")
             return None
         if len(html) < 20000:
             log(f"⚠️ CDP: página veio Vazia ({len(html)} bytes) de {url[:55]} — "
-                f"o ML pode estar detectando o Chromium headless.")
+                f"o site pode estar detectando o Chromium headless.")
         return _Page(html, url)
+    except Exception as exc:
+        log(f"⚠️ CDP falhou em {url[:55]}: {type(exc).__name__}: {exc}")
+        _CDP["msg"] = f"{type(exc).__name__}"
+        return None
     finally:
         try:
             ws.close()
         except Exception:
             pass
+
+
+def cdp_eval(url, expression, wait=None, timeout=90, await_promise=True):
+    """Executa JavaScript no Chromium via CDP e devolve {ok, value/error}."""
+    ws = _cdp_open(url, wait, timeout)
+    if ws is None:
+        return {"ok": False, "error": "CDP indisponível"}
+    try:
+        value = _cdp_evaluate(ws, expression, await_promise=await_promise,
+                              timeout=timeout)
+        return {"ok": True, "value": value}
+    except Exception as exc:
+        log(f"⚠️ CDP eval em {url[:55]}: {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def browser_eval(url, script, wait=3, timeout=None, await_promise=True):
+    """Roda JavaScript no navegador real (Selenium no PC, CDP no Android).
+
+    Devolve {"ok": True, "value": ...} ou {"ok": False, "error": "..."}.
+    É a base dos geradores de link e da raspagem via navegador.
+    """
+    result = selenium_eval(url, script, wait=wait, timeout=timeout,
+                           await_promise=await_promise)
+    if result is not None and result.get("ok"):
+        return result
+    cdp_result = cdp_eval(url, script, wait=(wait + 3 if wait else CDP_WAIT),
+                          timeout=timeout or 90, await_promise=await_promise)
+    if cdp_result is not None and cdp_result.get("ok"):
+        return cdp_result
+    return result or cdp_result or {"ok": False,
+                                    "error": "nenhum navegador disponível"}
 
 
 def cdp_close():
@@ -1626,20 +2206,30 @@ def cdp_close():
         _CDP["proc"] = None
 
 
-def browser_get(url, wait=3):
+def browser_get(url, wait=3, force_browser=False):
     """HTML de uma pagina, com o plano B ja aplicado.
 
-    requests/curl_cffi -> Chrome de verdade. No PC usa Selenium; no Android
-    (onde o Selenium nao existe para arm64) usa CDP direto no Chromium.
+    Com BROWSER_SCRAPING=1 (padrao) as lojas sao abertas no Chrome real. No PC
+    usa Selenium; no Android usa CDP direto no Chromium. Se o navegador falhar,
+    ainda tenta o HTTP para nao perder a fonte por completo.
     """
-    resp = http_get(url)
-    head = resp.text[:2000] if resp is not None else ""
-    if resp is None or "account-verification" in head or "suspicious-traffic" in head:
-        page = selenium_get(url, wait)
-        if page is not None:
-            return page
-        log("↪️ Selenium indisponível — tentando Chromium via CDP.")
-        return cdp_get(url, wait=(wait + 3 if wait else CDP_WAIT))
+    resp = None
+    if not force_browser and not BROWSER_SCRAPING:
+        resp = http_get(url)
+        head = resp.text[:2000] if resp is not None else ""
+        if resp is not None and "account-verification" not in head and "suspicious-traffic" not in head:
+            return resp
+
+    page = selenium_get(url, wait)
+    if page is not None:
+        return page
+    log("↪️ Selenium indisponível — tentando Chromium via CDP.")
+    page = cdp_get(url, wait=(wait + 3 if wait else CDP_WAIT))
+    if page is not None:
+        return page
+
+    if resp is None:
+        resp = http_get(url)
     return resp
 
 
@@ -1748,22 +2338,51 @@ def fetch_mercado_livre_products(search_query=None):
     return products
 
 
+def _shopee_search_data(keyword):
+    """Busca da Shopee pelo navegador (fetch same-origin) com fallback HTTP."""
+    api_path = (f"/api/v4/search/search_items?by=relevancy"
+                f"&keyword={urllib.parse.quote(keyword)}&limit=30&newest=0")
+    if BROWSER_SCRAPING:
+        script = """
+        const resp = await fetch(%s, {
+          credentials: 'include',
+          headers: {'x-api-source': 'pc', 'x-requested-with': 'XMLHttpRequest',
+                    'x-shopee-language': 'pt'}
+        });
+        const text = await resp.text();
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return text;
+        """ % json.dumps(api_path)
+        result = browser_eval("https://shopee.com.br/", script, wait=3,
+                              timeout=LINK_GEN_TIMEOUT)
+        if result and result.get("ok") and result.get("value"):
+            try:
+                return json.loads(result["value"])
+            except Exception as exc:
+                log(f"⚠️ Shopee (navegador): JSON inválido ({type(exc).__name__}).")
+
+    resp = http_get("https://shopee.com.br" + api_path, timeout=20,
+                    referer="https://shopee.com.br/",
+                    headers={"Accept": "application/json, text/plain, */*",
+                             "x-api-source": "pc", "x-shopee-language": "pt",
+                             "x-requested-with": "XMLHttpRequest"})
+    if resp is not None and resp.status_code == 200:
+        try:
+            return resp.json()
+        except Exception as exc:
+            log(f"⚠️ Shopee: {exc}")
+    else:
+        status = getattr(resp, "status_code", "erro")
+        log(f"⚠️ Shopee bloqueada (HTTP {status}). A planilha é a fonte confiável.")
+    return None
+
+
 def fetch_shopee_products(search_query=None):
     products = []
     keyword = search_query or "ofertas"
-    url = (f"https://shopee.com.br/api/v4/search/search_items?by=relevancy"
-           f"&keyword={urllib.parse.quote(keyword)}&limit=30&newest=0")
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://shopee.com.br/",
-        "x-api-source": "pc",
-        "x-shopee-language": "pt",
-        "x-requested-with": "XMLHttpRequest",
-    }
-    resp = http_get(url, headers=headers, timeout=20, referer="https://shopee.com.br/")
-    if resp is not None and resp.status_code == 200:
+    data = _shopee_search_data(keyword)
+    if data:
         try:
-            data = resp.json()
             for entry in data.get("items", []) or (data.get("data", {}) or {}).get("items", []):
                 basic = entry.get("item_basic") or entry
                 item_id, shop_id = basic.get("itemid"), basic.get("shopid")
@@ -1781,9 +2400,6 @@ def fetch_shopee_products(search_query=None):
                 })
         except Exception as exc:
             log(f"⚠️ Shopee: {exc}")
-    else:
-        status = getattr(resp, "status_code", "erro")
-        log(f"⚠️ Shopee bloqueada (HTTP {status}). A planilha é a fonte confiável.")
 
     if products:
         random.shuffle(products)
@@ -1795,7 +2411,7 @@ def fetch_amazon_products(search_query=None):
     products = []
     keyword = search_query or "eletronicos ofertas"
     url = f"https://www.amazon.com.br/s?k={urllib.parse.quote(keyword)}"
-    resp = http_get(url, timeout=25, referer="https://www.amazon.com.br/")
+    resp = browser_get(url, wait=3)
     if resp is None or resp.status_code != 200:
         log("⚠️ Amazon: página de busca indisponível (bloqueio anti-bot).")
         return products
@@ -1975,7 +2591,7 @@ def extract_from_html(html, url):
 def extract_product(url):
     """Extrai título, preço e imagem de um link de marketplace."""
     url = expand_url(url)
-    resp = http_get(url, timeout=25)
+    resp = browser_get(url, wait=3)
     if resp is None or resp.status_code != 200:
         return {"title": "", "price": None, "original_price": None, "image": "", "link": url}
 
@@ -2039,18 +2655,40 @@ def save_to_vitrine(item):
 # Publicação
 # --------------------------------------------------------------------------
 
+LINK_FAIL_NOTICE = {}
+
+
+def notify_link_failure(permalink, title, error):
+    """Avisa o dono que a oferta NAO foi publicada (com throttle por link)."""
+    key = permalink or title
+    now = time.time()
+    if now - LINK_FAIL_NOTICE.get(key, 0) < 1800:
+        return
+    LINK_FAIL_NOTICE[key] = now
+    log(f"⛔ Oferta não publicada: gerador de link falhou para {str(permalink)[:70]}")
+    notify_admin(
+        "⛔ *Oferta NÃO publicada* — o gerador de link falhou.\n\n"
+        f"📦 {str(title or 'Oferta')[:90]}\n"
+        f"🔗 {str(permalink or '')[:150]}\n"
+        f"⚠️ {str(error or 'erro desconhecido')[:300]}"
+    )
+
+
 def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
     price = product.get("price")
     old = product.get("original_price")
-    link, aviso = affiliate_link(product["permalink"], price, product.get("title"))
     title = product.get("title") or "Oferta Especial"
+    permalink = product.get("permalink") or product.get("link") or ""
+    link, aviso = generate_affiliate_link(permalink, price, title)
+
+    if not link:
+        notify_link_failure(permalink, title, aviso)
+        return False
 
     lines = ["🔥 OFERTA EM DESTAQUE", "", f"📦 {title}", ""]
     block = price_block(price, old)
     if block:
         lines += block.split("\n") + [""]
-    if aviso:
-        lines += [aviso, ""]
     # A URL nao vai no texto: fica so no botao, que e o que o usuario pediu
     # (link gigante em texto deixa o post feio).
     keyboard = {
@@ -2133,6 +2771,9 @@ def handle_private_message(message):
             f"• Proxy: {PROBE_STATE['msg'] if PROXIES else 'não configurado (ML/Shopee ficam bloqueados)'}",
             f"• Navegador: {'CDP' if IS_ANDROID else ('Selenium' if USE_SELENIUM else 'desligado')}"
             f" — {_CDP['msg'] if IS_ANDROID else SELENIUM_STATE['msg']}",
+            f"• Gerador ML: {generator_label('ml')} | Shopee: {generator_label('shopee')} | "
+            f"Amazon: {generator_label('amazon')}",
+            "• Login dos portais: `python bot.py --login-browser`",
             f"• Filtro: R$ {brl(MIN_PRICE)}–{brl(MAX_PRICE)}"
             f"{f' | desconto mín. {MIN_DISCOUNT:.0f}%' if MIN_DISCOUNT > 0 else ''}",
             f"• Lojas ML: {', '.join(known_stores()) or 'nenhuma (defina ML_STORES)'}",
@@ -2178,11 +2819,24 @@ def handle_private_message(message):
             send_message("❌ Nenhuma oferta encontrada. Os sites podem estar bloqueando o acesso "
                          "automático — nesse caso use a planilha.", chat_id=chat_id, reply_to=message_id)
             return
-        blocks = []
+        blocks, falhas = [], 0
         for p in results:
             block = price_block(p.get("price"), p.get("original_price")) or "💰 ver preço no link"
-            blocks.append(f"📦 {p['title'][:80]}\n{block}\n🔗 {affiliate_link(p['permalink'])[0]}")
-        send_message("\n\n".join(blocks), chat_id=chat_id, reply_to=message_id)
+            link, error = generate_affiliate_link(p["permalink"], p.get("price"), p.get("title"))
+            if not link:
+                falhas += 1
+                log(f"⛔ /buscar: sem link de afiliado para {p['title'][:50]} ({error})")
+                continue
+            blocks.append(f"📦 {p['title'][:80]}\n{block}\n🔗 {link}")
+        if not blocks:
+            send_message("❌ Encontrei ofertas, mas o gerador de link falhou. "
+                         "Confira o login dos portais (python bot.py --login-browser).",
+                         chat_id=chat_id, reply_to=message_id)
+            return
+        texto = "\n\n".join(blocks)
+        if falhas:
+            texto += f"\n\n⚠️ {falhas} oferta(s) sem link de afiliado foram omitidas."
+        send_message(texto, chat_id=chat_id, reply_to=message_id)
         return
 
     urls = re.findall(r"https?://[^\s]+", text)
@@ -2202,9 +2856,13 @@ def handle_private_message(message):
                          "sozinho para publicar o ultimo.",
                          chat_id=chat_id, reply_to=message_id)
             return
-        publish({**last, "permalink": affiliate_link(last["permalink"])[0]})
-        send_message(f"✅ Publicado no canal: {last['title'][:60]}",
-                     chat_id=chat_id, reply_to=message_id)
+        if publish(last):
+            send_message(f"✅ Publicado no canal: {last['title'][:60]}",
+                         chat_id=chat_id, reply_to=message_id)
+        else:
+            send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
+                         "Rode `python bot.py --login-browser` para renovar a sessão.",
+                         chat_id=chat_id, reply_to=message_id)
         return
 
     if url is None:
@@ -2224,7 +2882,8 @@ def handle_private_message(message):
     old = None if forced_price is not None else data.get("original_price")
     title = data.get("title") or "Oferta Especial"
     image = data.get("image") or ""
-    final_link, link_aviso = affiliate_link(data.get("link") or url, price, title)
+    permalink = data.get("link") or url
+    final_link, link_aviso = generate_affiliate_link(permalink, price, title)
 
     if price is None:
         send_message(
@@ -2232,7 +2891,7 @@ def handle_private_message(message):
             "O marketplace está bloqueando acesso automatizado (anti-bot). "
             "Verifique o proxy no /status.\n\n"
             "Use o comando manual:\n"
-            f"`/preco 89,90 {final_link}`",
+            f"`/preco 89,90 {final_link or permalink}`",
             chat_id=chat_id, reply_to=message_id,
         )
         return
@@ -2241,17 +2900,24 @@ def handle_private_message(message):
     block = price_block(price, old)
     if block:
         lines += block.split("\n") + [""]
-    lines += [f"🔗 {final_link}", "", f"✅ Preço encontrado: **R$ {brl(price)}**"]
+    lines += [f"🔗 {final_link or permalink}", "",
+              f"✅ Preço encontrado: **R$ {brl(price)}**"]
+    if link_aviso:
+        lines += ["", f"⚠️ {link_aviso}"]
     send_message("\n".join(lines), chat_id=chat_id, photo_url=image or None, reply_to=message_id)
 
-    product = {"id": "pv_" + hashlib.md5(final_link.encode()).hexdigest()[:10],
+    product = {"id": "pv_" + hashlib.md5(permalink.encode()).hexdigest()[:10],
                "title": title, "price": price, "original_price": old,
-               "permalink": final_link, "thumbnail": image, "source": "privado"}
+               "permalink": permalink, "thumbnail": image, "source": "privado"}
     LAST_PRODUCT[chat_id] = product
 
     if text.startswith("/canal"):
-        publish(product)
-        send_message("✅ Publicado no canal.", chat_id=chat_id, reply_to=message_id)
+        if publish(product):
+            send_message("✅ Publicado no canal.", chat_id=chat_id, reply_to=message_id)
+        else:
+            send_message("⛔ Não publiquei: o gerador de link de afiliado falhou.\n"
+                         "Rode `python bot.py --login-browser` para renovar a sessão.",
+                         chat_id=chat_id, reply_to=message_id)
     else:
         send_message("💡 Use `/canal` para publicar este produto no canal.",
                      chat_id=chat_id, reply_to=message_id)
@@ -2365,24 +3031,15 @@ def channel_listener():
             product_urls = [u for u in urls if is_product_url(u)]
             if not product_urls:
                 return
-            link_aviso = ""
+            product_url = product_urls[0].rstrip(".,)")
 
-            # 1. Preco (atual e o "de") sao lidos ANTES de montar os links: o link
+            # 1. Preco (atual e o "de") sao lidos ANTES de montar o link: o link
             # de loja so vira link de produto se a busca souber o que procurar.
             price, old_price = prices_from_text(raw)
             _lines = [l.strip() for l in raw.split("\n") if l.strip()]
             # O parceiro escreve uma frase de divulgacao na 1a linha; o titulo
             # vem na linha de baixo. title_from_lines() pula a frase.
             title_guess = title_from_lines(_lines)
-
-            # 2. Substitui TODOS os links pelos links com o seu codigo de afiliado
-            affiliate_urls = {}
-            for u in urls:
-                tagged, av = affiliate_link(u.rstrip(".,)"), price, title_guess)
-                affiliate_urls[u] = tagged
-                if av and u.rstrip(".,)") == product_urls[0].rstrip(".,)"):
-                    link_aviso = av
-            link = affiliate_urls[product_urls[0].rstrip(".,)")]
 
             # 3. Foto: usa a do post, senao extrai da pagina do produto
             image = None
@@ -2397,7 +3054,7 @@ def channel_listener():
 
             title = ""
             if not image or not price:
-                data = extract_product(product_urls[0])
+                data = extract_product(product_url)
                 title = data.get("title") or ""
                 image = image or (data.get("image") or "")
                 price = price or data.get("price")
@@ -2409,10 +3066,13 @@ def channel_listener():
 
             log(f"📡 Canal: {title[:45]} | foto={'sim' if image else 'nao'} "
                 f"| preco={brl(price)} | de={brl(old_price)}")
-            if link_aviso:
-                log(f"⚠️ {link_aviso}")
-                notify_admin(f"⚠️ Oferta do canal ignorada por comissao: "
-                             f"{link_aviso}\n{title[:70]}")
+
+            # 2. Gera o link no portal oficial. Sem link de afiliado a oferta
+            #    NÃO é publicada: melhor perder a oferta do que divulgar de graça.
+            link, link_aviso = generate_affiliate_link(product_url, price, title)
+            if not link:
+                log(f"⛔ Canal: sem link de afiliado ({link_aviso})")
+                notify_link_failure(product_url, title, link_aviso)
                 return
 
             # 4. Post montado do zero: titulo + preco antigo + preco atual.
@@ -2524,6 +3184,10 @@ def main():
     if "--login" in sys.argv:
         log("🔐 Modo de autenticação do Telethon — informe telefone e código quando solicitado.")
         channel_listener()
+        return
+
+    if "--login-browser" in sys.argv:
+        browser_login_session()
         return
 
     if not check_credentials():

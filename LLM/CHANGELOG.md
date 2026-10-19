@@ -5,6 +5,82 @@
 
 ---
 
+## [2026-10-19 09:25] — Sessão 25: link SEMPRE pelo gerador oficial + navegador persistente
+
+**Objetivo:** o usuário pediu trocar a montagem manual de `?tag`/`?matt_word`
+pelo link curto do **gerador oficial** de cada loja (ML, Shopee, Amazon), com
+raspagem via navegador nas 3 lojas. Se o gerador falhar, **não publicar** e
+avisar no privado.
+
+### Respostas do usuário (decisões)
+
+1. Autenticação: **perfil de navegador persistente** (login uma vez).
+2. "Sem tags": não anexar `?tag` — publicar o link do gerador (meli.la etc.).
+3. Falha do gerador: **não publica** + aviso no privado (`ADMIN_CHAT_ID`).
+4. Raspagem: navegador nas 3 lojas.
+
+### O que foi implementado em `bot.py` (3.281 linhas / 106 funções)
+
+- **Perfil persistente**: `selenium_driver(visible=False)` usa
+  `--user-data-dir=BROWSER_PROFILE_DIR` (`.browser-profile`), `quit_driver()`,
+  `browser_login_session()` e o modo `python bot.py --login-browser` (abre os
+  3 portais para login; ENTER fecha).
+- **`browser_eval(url, script)`**: JavaScript no navegador real — Selenium
+  (`selenium_eval`, via `execute_async_script`) e CDP puro
+  (`_cdp_open`/`_cdp_evaluate`/`cdp_eval`, agora com IIFE async) como plano B.
+- **`browser_get(url, wait, force_browser=False)`** força navegador quando
+  `BROWSER_SCRAPING=1` (padrão), com fallback HTTP.
+- **Geradores**:
+  - `generate_ml_affiliate_link` — POST `affiliate-program/api/v2/affiliates/createLink`
+    no linkbuilder (CSRF do cookie/meta), fallback DOM `#P0-2` + textarea.
+  - `generate_shopee_affiliate_link` — Open API GraphQL `generateShortLink`
+    com assinatura SHA256 (`_shopee_authorization`).
+  - `generate_amazon_affiliate_link` — SiteStripe `getShortUrl` via fetch no
+    domínio, fallback DOM `#amzn-ss-get-link-button`.
+  - `generate_affiliate_link` roteia por HOST (`_store_of_url`), cacheia em
+    `link_cache.json` (TTL 6h) e **rejeita link curto não expandido**
+    (`_short_input_error`) — assim nunca republica o link de outro afiliado
+    como se fosse o seu.
+- **Publicação**: `publish()` recusa quando não há link (`notify_link_failure`
+  com throttle de 30 min por link), `/buscar` omite ofertas sem link, `/canal`
+  guarda o **permalink original** e regenera no publish; `channel_listener`
+  idem (a geração passou para depois de preço/título, porque link de loja do
+  ML precisa dos dois para resolver o produto).
+- **Raspagem**: `extract_product()` e `store_catalog()` usam `browser_get`;
+  Shopee usa `_shopee_search_data()` (fetch same-origin no navegador +
+  fallback HTTP); Amazon usa `browser_get` na busca.
+- `/status` mostra o estado dos 3 geradores e lembra do `--login-browser`.
+
+### Config nova (`.env.example`)
+
+`ML_AFFILIATE_TAG` (fallback `ML_MATT_WORD`), `SHOPEE_APP_ID`/`SHOPEE_SECRET`,
+`AMAZON_MARKETPLACE_ID` (default `A2Q3Y263D00KWC`), `BROWSER_SCRAPING=1`,
+`BROWSER_PROFILE_DIR`, `LINK_GEN_TIMEOUT=60`. `.gitignore` cobre
+`.browser-profile/`, `.chrome-cdp/`, `link_cache.json` e `.venv/`.
+
+### Bug achado nos testes
+
+A versão anterior do roteador usava `"a.co" in url` — **`magazineluiza.com.br`
+contém `a.co`** e caía no gerador da Amazon. Agora a loja é decidida só pelo
+host (`_store_of_url`).
+
+### Testado — 22/22
+
+`tests/test_affiliate.py` (unittest, offline, sem rede/navegador): parsers de
+link curto (JSON do ML, GraphQL da Shopee, `amzn.to` com `\/` escapado), ASIN
+(`/dp/`, `/gp/product/`, `?asin=`), assinatura Shopee == SHA256 manual,
+geradores com `browser_eval`/`requests.post` mockados, rota por host, cache e
+`publish` recusando sem link **sem** chamar `send_message`.
+
+### ❌ Não testado (exige credenciais/sessão real)
+
+- Login real nos portais e chamadas AO VIVO de `createLink`/SiteStripe — as
+  APIs internas não são documentadas e os seletores do DOM podem ter mudado.
+- Termux/Android: o perfil persistente exige tela para o login; o CDP funciona,
+  mas o gerador ML/Amazon continuará falhando sem sessão autenticada.
+
+---
+
 ## [2026-10-15 15:45] — Sessão 24: o título vinha sendo a frase do parceiro
 
 **Objetivo:** o usuário: *"quando pegamos o texto do grupo aliado, precisamos

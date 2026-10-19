@@ -1,5 +1,10 @@
 # Recuperação do `bot.py` a partir do bytecode
 
+> ⚠️ **DESATUALIZADO como spec (19/10/2026):** a Sessão 25 reescreveu a geração
+> de links — `affiliate_link()` virou wrapper de `generate_affiliate_link()`,
+> que usa os geradores oficiais (ver `CHANGELOG.md` topo). Este documento
+> continua útil como registro histórico do bytecode perdido de 14/10.
+
 > **Este arquivo é a referência mais importante da pasta LLM.**
 > O código-fonte do `bot.py` foi perdido do disco, mas o bytecode
 > (`__pycache__/bot.cpython-311.pyc`) sobreviveu e foi disassembly completo.

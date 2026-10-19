@@ -273,6 +273,7 @@ Sempre olhar o log com `tail -f ~/bot.log`.
 | Chrome headless trava | Termux exige `--no-zygote --single-process` + `LD_PRELOAD=libtermux-exec.so`. |
 | Termux foi movido | `com.termux` no Google Play está desatualizado — use **F-Droid**. |
 | Permissões de pasta | `termux-setup-storage` para ler `~/bot`. |
+| **Login dos portais (Sessão 25)** | O perfil `.browser-profile` exige tela para o `python bot.py --login-browser`. No Termux: copie o perfil já logado do PC ou conte só com a Shopee (Open API) para gerar link. |
 
 ---
 
@@ -281,3 +282,7 @@ Sempre olhar o log com `tail -f ~/bot.log`.
 - ⏳ **Nada foi alterado no `bot.py` nesta sessão** — só análise e pesquisa.
 - A mudança 4.1 (Pillow opcional) é pequena e urgentemente recommendada:
   hoje, sem Pillow no Android, **o bot não inicia**.
+- 🆕 Sessão 25 (19/10): o bot agora gera o link no portal oficial e só publica
+  com esse link. No Termux o CDP continua raspando, mas sem perfil logado os
+  geradores ML/Amazon falham e a oferta **não é publicada** (de propósito).
+  A Shopee funciona pela Open API (app id/secret no `.env`).

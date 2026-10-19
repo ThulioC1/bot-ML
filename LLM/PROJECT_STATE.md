@@ -1,6 +1,34 @@
 # Estado do Projeto
 
-> Última atualização: **2026-10-15 (sessão 23 — botão + preço antigo)**
+> Última atualização: **2026-10-19 (sessão 25 — gerador oficial de links + navegador persistente)**
+
+## 🆕 Sessão 25 — o link sai do GERADOR OFICIAL (19/10)
+
+**Regra nova:** o bot **não anexa mais** `?matt_word` / `?smtt` / `?tag` na URL.
+Ele abre o portal de afiliado no Chrome (perfil persistente) e publica o link
+curto que o gerador devolve (`meli.la`, `shope.ee`, `amzn.to`). Se o gerador
+falhar, a oferta **não é publicada** e o dono recebe aviso no privado
+(`ADMIN_CHAT_ID`, throttle de 30 min por link).
+
+| Loja | Como gera | Requer |
+|---|---|---|
+| Mercado Livre | POST `affiliate-program/api/v2/affiliates/createLink` (fallback DOM `#P0-2`) | login no linkbuilder |
+| Shopee | GraphQL `generateShortLink` na Open API | `SHOPEE_APP_ID` + `SHOPEE_SECRET` |
+| Amazon | SiteStripe `getShortUrl` (fallback DOM `#amzn-ss-get-link-button`) | login no Amazon Associados |
+
+**Login (uma vez):** `python bot.py --login-browser` — abre os 3 portais; o
+perfil fica em `BROWSER_PROFILE_DIR` (`.browser-profile/`, fora do git).
+
+**Infra de navegador:**
+- `selenium_driver(visible)` / `quit_driver()` / `browser_login_session()`
+- `browser_eval()` = JavaScript no Chrome real: Selenium no PC, CDP no Android
+- `browser_get(force_browser)` força navegador quando `BROWSER_SCRAPING=1`
+
+**Roteamento por host (`_store_of_url`), cache em `link_cache.json` (6h) e
+rejeição de link curto não expandido** — evita publicar link de outro afiliado.
+
+**Pendência real:** sem sessão logada, os geradores ML/Amazon falham; no
+Termux o login exige tela. Ver `ISSUES.md`.
 
 ## ✅ O código principal voltou
 
@@ -84,7 +112,8 @@ nome do produto em vez da frase.
 ## O que é
 
 Bot de ofertas/afiliados da **Vagante Promoções**. Coleta produtos de várias
-fontes, aplica tags de afiliado, gera arte e publica em Telegram e Instagram.
+fontes, gera o link no portal oficial de afiliados de cada loja, cria arte e
+publica em Telegram e Instagram. Oferta sem link de afiliado não é publicada.
 
 ## Estrutura de arquivos
 
