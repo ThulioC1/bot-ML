@@ -75,6 +75,37 @@ class AmazonAsinTests(unittest.TestCase):
         self.assertEqual(bot._amazon_asin("https://www.amazon.com.br/ofertas"), "")
 
 
+class AmazonImageTests(unittest.TestCase):
+    def test_landing_image_usa_data_old_hires(self):
+        html = """
+        <html><head><title>Echo Dot | Amazon.com.br</title></head><body>
+          <div id="imgTagWrapperId">
+            <img data-old-hires="https://m.media-amazon.com/images/I/6182._AC_SL1000_.jpg"
+                 src="https://m.media-amazon.com/images/I/6182._AC_SY300_.jpg">
+          </div>
+          <span class="a-price"><span class="a-offscreen">R$ 329,00</span></span>
+        </body></html>
+        """
+        title, price, _, image = bot.extract_from_html(
+            html, "https://www.amazon.com.br/dp/B07FZ8S74R")
+        self.assertEqual(image, "https://m.media-amazon.com/images/I/6182._AC_SL1000_.jpg")
+        self.assertEqual(price, 329.0)
+        self.assertEqual(title, "Echo Dot")
+
+    def test_dynamic_image_escolhe_o_maior(self):
+        html = """
+        <html><head><title>Produto</title></head><body>
+        <img id="landingImage" data-a-dynamic-image='{
+            "https://m.media-amazon.com/images/I/a._AC_SY355_.jpg": [355, 355],
+            "https://m.media-amazon.com/images/I/a._AC_SL1000_.jpg": [1000, 1000]}'>
+        <span class="a-price"><span class="a-offscreen">R$ 99,90</span></span>
+        </body></html>
+        """
+        _, _, _, image = bot.extract_from_html(
+            html, "https://www.amazon.com.br/dp/B0CXF5TCLK")
+        self.assertEqual(image, "https://m.media-amazon.com/images/I/a._AC_SL1000_.jpg")
+
+
 class ShopeeAuthorizationTests(unittest.TestCase):
     def test_signature_matches_manual_sha256(self):
         body = '{"query":"x"}'

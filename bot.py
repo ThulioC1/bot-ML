@@ -2987,6 +2987,43 @@ def _json_ld_products(soup):
     return found
 
 
+def _amazon_image(soup):
+    """Imagem principal da Amazon.
+
+    A pagina de produto da Amazon nao traz og:image nem JSON-LD Product: a
+    imagem fica em #landingImage/#imgTagWrapperId, em data-old-hires (maior
+    resolucao) ou data-a-dynamic-image (JSON com varios tamanhos).
+    """
+    def from_node(node):
+        for attr in ("data-old-hires", "src"):
+            value = (node.get(attr) or "").strip()
+            if value.startswith(("http://", "https://")):
+                return value
+        try:
+            sizes = json.loads(node.get("data-a-dynamic-image") or "")
+        except (TypeError, ValueError):
+            sizes = {}
+        if isinstance(sizes, dict) and sizes:
+            def area(item):
+                dims = item[1]
+                if isinstance(dims, list) and len(dims) >= 2:
+                    return dims[0] * dims[1]
+                return 0
+            best = max(sizes.items(), key=area)[0]
+            if best.startswith(("http://", "https://")):
+                return best
+        return ""
+
+    for selector in ("#landingImage", "#imgTagWrapperId img",
+                     "#main-image-container img", "[data-old-hires]"):
+        node = soup.select_one(selector)
+        if node is not None:
+            found = from_node(node)
+            if found:
+                return found
+    return ""
+
+
 def extract_from_html(html, url):
     soup = BeautifulSoup(html, "html.parser")
     title, price, old_price, image = "", None, None, ""
@@ -3019,6 +3056,9 @@ def extract_from_html(html, url):
             price = price or parse_money(offers.get("price") or offers.get("lowPrice") or offers.get("highPrice"))
             old_price = old_price or parse_money(offers.get("original_price") or offers.get("listPrice"))
         break
+
+    if not image:
+        image = _amazon_image(soup)
 
     if price is None:
         for prop, setter in (("product:price:amount", "p"), ("og:price:amount", "p"), ("twitter:data1", "p")):
