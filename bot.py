@@ -3839,24 +3839,20 @@ def channel_listener():
             # vem na linha de baixo. title_from_lines() pula a frase.
             title_guess = title_from_lines(_lines)
 
-            # 3. Foto: usa a do post, senao extrai da pagina do produto
-            image = None
-            if event.photo:
-                try:
-                    path = await event.download_media()
-                    if path:
-                        image = upload_to_blob(path, f"canal_{int(time.time())}.jpg")
-                        Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+            # 3. Foto: so usa a oficial da pagina do produto. A foto do post
+            #    do parceiro costuma vir com marca d'agua da loja; se a pagina
+            #    nao devolver imagem, a oferta e descartada em vez de publicar
+            #    a marca d'agua de terceiros.
+            data = extract_product(product_url)
+            title = data.get("title") or ""
+            image = data.get("image") or ""
+            price = price or data.get("price")
+            old_price = old_price or data.get("original_price")
 
-            title = ""
-            if not image or not price:
-                data = extract_product(product_url)
-                title = data.get("title") or ""
-                image = image or (data.get("image") or "")
-                price = price or data.get("price")
-                old_price = old_price or data.get("original_price")
+            if not image and event.photo:
+                log("⏭️ Canal: sem imagem oficial; oferta descartada para não "
+                    "publicar a foto com marca d'água do parceiro.")
+                return
 
             if not title:
                 # ultimo recurso: qualquer linha util, senao um placeholder
