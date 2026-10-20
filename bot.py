@@ -207,8 +207,9 @@ MIN_DISCOUNT = _num_env("MIN_DISCOUNT", 0)      # 0 = nao exige desconto
 
 # Filtro do Instagram: so entra na fila se o desconto real for >= esse valor.
 # Sem preco antigo nao da para medir desconto, entao tambem fica de fora.
-# 0 = desliga e volta a enfileirar tudo que tem imagem.
-IG_MIN_DISCOUNT = _num_env("IG_MIN_DISCOUNT", 20)
+# Default 0 = desligado, igual ao MIN_DISCOUNT: a raspagem do ML e o portal
+# Shopee quase nunca trazem preco antigo, e com 20 o IG ficava sem fila.
+IG_MIN_DISCOUNT = _num_env("IG_MIN_DISCOUNT", 0)
 
 # Instagram: quantos posts por ciclo (o ciclo roda a cada INTERVAL_INSTAGRAM,
 # default 3h) e pausa em segundos entre um post e outro.
