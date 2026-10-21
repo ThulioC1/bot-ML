@@ -1,3 +1,5 @@
+window.__painelIniciou = true;
+
 const LABELS = {
   channels: "Canais do Telegram",
   sheet: "Planilha",
