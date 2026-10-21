@@ -1,6 +1,23 @@
 # Estado do Projeto
 
-> Última atualização: **2026-10-19 (sessão 26.8 — cupons ativos do ML no grupo)**
+> Última atualização: **2026-10-21 (sessão 26.9 — painel de controle remoto)**
+
+## 🆕 Sessão 26.9 — Painel de controle remoto (21/10)
+
+Painel web (`panel/`, para a Vercel) com Firebase Auth (e-mail/senha) e
+Firestore como caixa de comandos, porque o bot fica atrás de CGNAT e não pode
+receber conexões. O dono liga/desliga `channels`, `sheet`, `scrape`, `coupons`,
+`instagram` e `telegram`; dispara os ciclos; apaga item da vitrine (remove do
+`vitrine.json` e reenvia ao Vercel Blob); e vê status + últimas 60 linhas de
+log. O bot sincroniza por HTTPS de saída via `panel_sync.py` (REST puro com
+`requests`, sem SDK), a cada `PANEL_POLL_SECONDS` (default 10).
+
+Tudo é aditivo: sem as 4 variáveis `FIREBASE_*` no `.env` o painel fica
+desativado e o bot roda exatamente como antes (flags default `True`).
+`LOG_BUFFER`, `PANEL_STATE`, `control_enabled()`, `delete_from_vitrine()` e
+`RUN_NOW` vivem no `bot.py`. 81 testes passando (+29). Falta o dono criar o
+projeto Firebase, os usuários admin/bot, publicar `panel/firestore.rules` e
+subir `panel/` na Vercel.
 
 ## 🆕 Sessão 26.8 — Cupons do Mercado Livre (19/10)
 

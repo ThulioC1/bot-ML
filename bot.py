@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+from collections import deque
 import random
 import re
 import shutil
@@ -53,8 +54,13 @@ def _setup_stdout():
 _setup_stdout()
 
 
+LOG_BUFFER = deque(maxlen=200)
+
+
 def log(msg):
-    print(f"[{time.strftime('%d/%m %H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%d/%m %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    LOG_BUFFER.append(line)
 
 
 # --------------------------------------------------------------------------
@@ -220,9 +226,60 @@ IG_POST_DELAY = _num_env("IG_POST_DELAY", 30)
 CUPOM_POSTS_PER_CYCLE = max(1, int(_num_env("CUPOM_POSTS_PER_CYCLE", 3)))
 CUPOM_DELAY = _num_env("CUPOM_DELAY", 5)
 
+CONTROL_LOCK = threading.Lock()
+CONTROL = {
+    "channels": True,
+    "sheet": True,
+    "scrape": True,
+    "coupons": True,
+    "instagram": True,
+    "telegram": True,
+}
+
+PANEL_STATE = {"last_telegram": 0.0, "last_instagram": 0.0, "last_listener": 0.0}
+
+RUN_LOCK = threading.Lock()
+RUN_NOW = {"telegram": False, "instagram": False}
+
+
+def control_snapshot():
+    with CONTROL_LOCK:
+        return dict(CONTROL)
+
+
+def control_enabled(name):
+    with CONTROL_LOCK:
+        return bool(CONTROL.get(name, True))
+
+
+def apply_control_flags(flags):
+    if not isinstance(flags, dict):
+        return
+    with CONTROL_LOCK:
+        for name in CONTROL:
+            value = flags.get(name)
+            if isinstance(value, bool):
+                CONTROL[name] = value
+
+
+def request_run(cycle):
+    with RUN_LOCK:
+        if cycle in RUN_NOW:
+            RUN_NOW[cycle] = True
+
+
+def take_run(cycle):
+    with RUN_LOCK:
+        if RUN_NOW.get(cycle):
+            RUN_NOW[cycle] = False
+            return True
+    return False
+
+
 SEEN_FILE = BASE_DIR / "seen.json"
 IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
 VITRINE_FILE = BASE_DIR / "vitrine.json"
+VITRINE_LOCK = threading.Lock()
 OFFSET_FILE = BASE_DIR / "telegram_offset.json"
 STORES_FILE = BASE_DIR / "lojas.json"
 CUPONS_FILE = BASE_DIR / "cupons_enviados.json"
@@ -2934,8 +2991,8 @@ def rank_ofertas(products):
     return sorted(products, key=chave)
 
 
-def collect_products(include_scrape=True, search_query=None):
-    products = fetch_sheet_products()
+def collect_products(include_scrape=True, search_query=None, include_sheet=True):
+    products = fetch_sheet_products() if include_sheet else []
     if search_query:
         products += (fetch_mercado_livre_products(search_query)
                      + fetch_shopee_products(search_query)
@@ -3128,31 +3185,57 @@ def save_to_vitrine(item):
     if preco is None or (isinstance(preco, (int, float)) and preco <= 0):
         log(f"⚠️ Vitrine: '{str(item.get('title'))[:40]}' sem preço — não entra na bio.")
         return
-    vitrine = load_json(VITRINE_FILE, [])
-    # limpa qualquer item quebrado que tenha ficado de execuções antigas
-    vitrine = [v for v in vitrine if isinstance(v, dict)
-               and isinstance(v.get("price"), (int, float)) and v.get("price") > 0]
-    if any(v.get("link") == item.get("link") for v in vitrine[:20]):
-        return
-    vitrine.insert(0, {
-        "id": item["id"],
-        "title": item["title"],
-        "price": preco,
-        "original_price": item.get("original_price"),
-        "link": item["link"],
-        "image": item.get("image") or "",
-        "time": time.strftime("%d/%m/%Y %H:%M"),
-    })
-    save_json(VITRINE_FILE, vitrine[:40])
-    total = len(vitrine[:40])
-    log(f"📦 Vitrine atualizada ({total} itens).")
-    # Sem isto a pagina da bio (vagantepromo.vercel.app) NUNCA muda: ela le o
-    # vitrine.json do Vercel Blob e o bot so escrevia no disco do celular.
-    url = upload_to_blob(VITRINE_FILE, "vitrine.json")
-    if url:
-        log(f"🌐 Bio atualizada: {url[:78]}")
-    else:
-        log("⚠️ Vitrine não foi publicada na bio (falha no Vercel Blob).")
+    with VITRINE_LOCK:
+        vitrine = load_json(VITRINE_FILE, [])
+        # limpa qualquer item quebrado que tenha ficado de execuções antigas
+        vitrine = [v for v in vitrine if isinstance(v, dict)
+                   and isinstance(v.get("price"), (int, float)) and v.get("price") > 0]
+        if any(v.get("link") == item.get("link") for v in vitrine[:20]):
+            return
+        vitrine.insert(0, {
+            "id": item["id"],
+            "title": item["title"],
+            "price": preco,
+            "original_price": item.get("original_price"),
+            "link": item["link"],
+            "image": item.get("image") or "",
+            "time": time.strftime("%d/%m/%Y %H:%M"),
+        })
+        save_json(VITRINE_FILE, vitrine[:40])
+        total = len(vitrine[:40])
+        log(f"📦 Vitrine atualizada ({total} itens).")
+        # Sem isto a pagina da bio (vagantepromo.vercel.app) NUNCA muda: ela le o
+        # vitrine.json do Vercel Blob e o bot so escrevia no disco do celular.
+        url = upload_to_blob(VITRINE_FILE, "vitrine.json")
+        if url:
+            log(f"🌐 Bio atualizada: {url[:78]}")
+        else:
+            log("⚠️ Vitrine não foi publicada na bio (falha no Vercel Blob).")
+
+
+def delete_from_vitrine(item_id, remove_from_seen=False):
+    """Remove um item da vitrine, do arquivo local e do Vercel Blob."""
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        return False, "id não informado"
+    with VITRINE_LOCK:
+        vitrine = load_json(VITRINE_FILE, [])
+        if not isinstance(vitrine, list):
+            return False, "vitrine inválida"
+        restantes = [v for v in vitrine
+                     if not (isinstance(v, dict) and str(v.get("id")) == item_id)]
+        if len(restantes) == len(vitrine):
+            return False, "item não encontrado"
+        save_json(VITRINE_FILE, restantes)
+        url = upload_to_blob(VITRINE_FILE, "vitrine.json")
+        if not url:
+            return False, "salvo no disco, mas falhou publicar no Blob"
+        if remove_from_seen:
+            vistos = load_json(SEEN_FILE, [])
+            if isinstance(vistos, list):
+                save_json(SEEN_FILE, [s for s in vistos if str(s) != item_id])
+        log(f"🗑️ Vitrine: item {item_id} removido ({len(restantes)} restantes).")
+        return True, f"removido; {len(restantes)} itens restantes"
 
 
 # --------------------------------------------------------------------------
@@ -3223,6 +3306,9 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
 
 def schedule_instagram(product, title, price, old):
     """Enfileira o post do Instagram. Devolve True se entrou na fila."""
+    if not control_enabled("instagram"):
+        log("⏸️ Instagram desligado no painel; arte não enfileirada.")
+        return False
     pct = discount_pct(price, old)
     if IG_MIN_DISCOUNT > 0:
         if pct is None:
@@ -3416,6 +3502,9 @@ def post_coupon(coupon, chat_id=None):
 
 def cupons_cycle(chat_id=None):
     """Publica no grupo os cupons ativos que ainda não foram enviados."""
+    if not control_enabled("coupons"):
+        log("⏸️ Cupons desligados no painel.")
+        return 0
     with COUPON_LOCK:
         page = browser_get(ML_COUPONS_URL, wait=6)
         if page is None:
@@ -3822,6 +3911,9 @@ def channel_listener():
             raw = event.raw_text or ""
             if len(raw) < 15:
                 return
+            if not control_enabled("channels"):
+                return
+            PANEL_STATE["last_listener"] = time.time()
 
             urls = re.findall(r"https?://[^\s]+", raw)
             for u in urls:
@@ -3905,11 +3997,16 @@ def channel_listener():
 # --------------------------------------------------------------------------
 
 def telegram_cycle():
+    if not control_enabled("telegram"):
+        log("⏸️ Ciclo do Telegram desligado no painel.")
+        return
+    PANEL_STATE["last_telegram"] = time.time()
     log("\n🤖 Ciclo do Telegram: planilha + raspagem")
     BLOCKED_SOURCES.clear()
     proxy_health()
     seen = load_json(SEEN_FILE)
-    products = collect_products(include_scrape=True)
+    products = collect_products(include_scrape=control_enabled("scrape"),
+                                include_sheet=control_enabled("sheet"))
 
     new_sheet = [p for p in products if p["source"] == "planilha" and p["id"] not in seen]
     if new_sheet:
@@ -3936,6 +4033,10 @@ def telegram_cycle():
 
 
 def instagram_cycle():
+    if not control_enabled("instagram"):
+        log("⏸️ Instagram desligado no painel.")
+        return
+    PANEL_STATE["last_instagram"] = time.time()
     queue = load_json(BASE_DIR / "ig_queue.json", [])
     if not queue:
         log("📸 Instagram: fila vazia.")
@@ -3981,6 +4082,61 @@ def internet_online(timeout=10):
         except Exception:
             continue
     return False
+
+
+def _vitrine_publica():
+    vitrine = load_json(VITRINE_FILE, [])
+    if not isinstance(vitrine, list):
+        return []
+    saida = []
+    for item in vitrine[:40]:
+        if not isinstance(item, dict):
+            continue
+        saida.append({
+            "id": str(item.get("id") or ""),
+            "title": str(item.get("title") or "")[:120],
+            "price": item.get("price"),
+            "link": str(item.get("link") or ""),
+            "image": str(item.get("image") or ""),
+            "time": str(item.get("time") or ""),
+        })
+    return saida
+
+
+def panel_status():
+    fila = load_json(BASE_DIR / "ig_queue.json", [])
+    vistos = load_json(SEEN_FILE, [])
+    return {
+        "updated_at": int(time.time()),
+        "online": bool(NET_STATE.get("online", True)),
+        "net": NET_STATE.get("msg", ""),
+        "flags": control_snapshot(),
+        "last_telegram": PANEL_STATE.get("last_telegram", 0.0),
+        "last_instagram": PANEL_STATE.get("last_instagram", 0.0),
+        "last_listener": PANEL_STATE.get("last_listener", 0.0),
+        "seen": len(vistos) if isinstance(vistos, list) else 0,
+        "ig_queue": len(fila) if isinstance(fila, list) else 0,
+        "vitrine": _vitrine_publica(),
+        "logs": list(LOG_BUFFER)[-60:],
+    }
+
+
+def panel_execute(kind, payload):
+    payload = payload if isinstance(payload, dict) else {}
+    if kind in ("run_telegram", "run_cycle"):
+        request_run("telegram")
+        return "ciclo do Telegram agendado"
+    if kind == "run_instagram":
+        request_run("instagram")
+        return "ciclo do Instagram agendado"
+    if kind in ("delete_vitrine", "vitrine_delete"):
+        ok, msg = delete_from_vitrine(payload.get("id"),
+                                      bool(payload.get("remove_from_seen")))
+        return ("ok: " if ok else "erro: ") + msg
+    if kind == "set_flags":
+        apply_control_flags(payload.get("flags") or payload)
+        return "flags aplicadas"
+    raise ValueError(f"comando desconhecido: {kind}")
 
 
 def main():
@@ -4033,6 +4189,12 @@ def main():
     threading.Thread(target=private_listener, daemon=True).start()
     threading.Thread(target=channel_listener, daemon=True).start()
 
+    try:
+        from panel_sync import start_panel_sync
+        start_panel_sync(apply_control_flags, panel_execute, panel_status, log)
+    except Exception as exc:
+        log(f"⚠️ Painel: não iniciou ({type(exc).__name__}: {exc})")
+
     last_telegram = 0.0
     last_instagram = 0.0
     last_net_check = 0.0
@@ -4067,11 +4229,17 @@ def main():
                 online = agora_online
 
             if online:
-                if disparar_telegram or now - last_telegram >= INTERVAL_TELEGRAM:
+                if take_run("telegram"):
+                    disparar_telegram = True
+                if take_run("instagram"):
+                    disparar_instagram = True
+                if control_enabled("telegram") and (disparar_telegram or
+                                                    now - last_telegram >= INTERVAL_TELEGRAM):
                     telegram_cycle()
                     last_telegram = now
                     disparar_telegram = False
-                if disparar_instagram or now - last_instagram >= INTERVAL_INSTAGRAM:
+                if control_enabled("instagram") and (disparar_instagram or
+                                                     now - last_instagram >= INTERVAL_INSTAGRAM):
                     instagram_cycle()
                     last_instagram = now
                     disparar_instagram = False

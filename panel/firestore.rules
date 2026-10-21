@@ -1,0 +1,36 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function admin() {
+      return request.auth != null
+        && request.auth.uid in ["COLE_O_UID_DO_ADMIN"];
+    }
+
+    function bot() {
+      return request.auth != null
+        && request.auth.uid in ["COLE_O_UID_DO_BOT"];
+    }
+
+    match /panel_control/{doc} {
+      allow read: if admin() || bot();
+      allow write: if admin();
+    }
+
+    match /panel_status/{doc} {
+      allow read: if admin() || bot();
+      allow write: if bot();
+    }
+
+    match /panel_commands/{doc} {
+      allow read: if admin() || bot();
+      allow create: if admin();
+      allow update: if bot();
+      allow delete: if admin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -5,6 +5,49 @@
 
 ---
 
+## [2026-10-21 11:20] — Sessão 26.9: painel de controle remoto (Firebase + Vercel)
+
+**Objetivo:** painel web na Vercel, com login, para ligar/desligar funções do
+bot, apagar itens da vitrine, disparar ciclos e ver status/logs — sem quebrar o
+que já funciona.
+
+**Arquivos alterados:**
+- `bot.py` — `CONTROL` (`channels`, `sheet`, `scrape`, `coupons`, `instagram`,
+  `telegram`, todos `True` por padrão) com `control_enabled()`,
+  `apply_control_flags()` e `CONTROL_LOCK`; `PANEL_STATE` (último ciclo de
+  cada fluxo); `LOG_BUFFER` (deque de 200 linhas) dentro do `log()`;
+  `VITRINE_LOCK` e `delete_from_vitrine()`; `panel_status()` e
+  `panel_execute()`; gates em `channel_listener`, `telegram_cycle`
+  (planilha/raspagem separadas), `cupons_cycle`, `instagram_cycle` e
+  `schedule_instagram`; `RUN_NOW`/`request_run`/`take_run` para "rodar agora";
+  `main()` sobe o `panel_sync` quando o Firebase está configurado.
+- `panel_sync.py` (novo) — login (`signInWithPassword`), refresh de token e
+  Firestore por REST puro (`requests`), sem SDK: lê `panel_control/state`,
+  processa `panel_commands` pendentes e grava `panel_status/state` com logs.
+- `panel/` (novo) — `index.html`, `app.js`, `firebase-config.js` e
+  `firestore.rules` para a Vercel: login e-mail/senha, toggles das funções,
+  vitrine com "Remover", logs e botões de ciclo.
+- `.env.example` — `FIREBASE_PROJECT_ID/API_KEY/BOT_EMAIL/BOT_PASSWORD` e
+  `PANEL_POLL_SECONDS=10`.
+- `tests/test_affiliate.py` — +29 testes (CONTROL, RUN_NOW, painel,
+  `delete_from_vitrine`, `panel_sync`), total 81.
+
+**Análise / o que foi observado:**
+- O bot fica atrás de CGNAT (Kali/Termux); o painel nunca abre conexão para
+  ele. O Firestore como caixa de comandos só exige HTTPS de saída do bot.
+- Sem as 4 variáveis do Firebase o painel fica desativado e o bot roda
+  exatamente como antes (flags default `True`).
+- Firestore REST exige os tipos (`booleanValue`, `integerValue`...);
+  `_to_value`/`_from_value` convertem e têm teste de ida-e-volta.
+- A vitrine é reenviada ao Vercel Blob a cada remoção, então a bio muda na hora.
+
+**Resultado:**
+- ✅ 81 testes passando.
+- ⚠️ Falta o dono criar o projeto Firebase, os usuários admin/bot, colar os UIDs
+  em `panel/firestore.rules`, subir `panel/` na Vercel e validar no Kali.
+
+---
+
 ## [2026-10-19 15:40] — Sessão 26.8: cupons ativos do ML no grupo
 
 **Objetivo:** o dono mandou o HTML real capturado pelo `/diagcupons`; escrever

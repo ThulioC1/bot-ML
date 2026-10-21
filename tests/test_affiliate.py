@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -13,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot
+import panel_sync
 
 
 def tearDownModule():
@@ -663,6 +665,272 @@ class CupomCycleTests(unittest.TestCase):
         post.assert_called_once()
         self.assertEqual(post.call_args[0][0]["id"], "2")
         self.assertEqual(save.call_args[0][1]["2"]["seller"], "Loja X")
+
+
+class ControlFlagTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = dict(bot.CONTROL)
+
+    def tearDown(self):
+        with bot.CONTROL_LOCK:
+            bot.CONTROL.clear()
+            bot.CONTROL.update(self._orig)
+
+    def test_defaults_ligados(self):
+        for nome in ("channels", "sheet", "scrape", "coupons", "instagram", "telegram"):
+            self.assertTrue(bot.control_enabled(nome))
+
+    def test_desconhecido_nao_bloqueia(self):
+        self.assertTrue(bot.control_enabled("nao_existe"))
+
+    def test_apply_aplica_so_booleanos(self):
+        bot.apply_control_flags({"instagram": False, "scrape": "sim", "x": False})
+        self.assertFalse(bot.control_enabled("instagram"))
+        self.assertTrue(bot.control_enabled("scrape"))
+
+    def test_snapshot_e_copia(self):
+        snap = bot.control_snapshot()
+        snap["instagram"] = False
+        self.assertTrue(bot.control_enabled("instagram"))
+
+
+class RunNowTests(unittest.TestCase):
+    def setUp(self):
+        for chave in bot.RUN_NOW:
+            bot.RUN_NOW[chave] = False
+
+    def test_consome_uma_vez(self):
+        self.assertFalse(bot.take_run("telegram"))
+        bot.request_run("telegram")
+        self.assertTrue(bot.take_run("telegram"))
+        self.assertFalse(bot.take_run("telegram"))
+
+    def test_ciclo_desconhecido_e_ignorado(self):
+        bot.request_run("busca")
+        self.assertFalse(bot.take_run("busca"))
+
+
+class PanelExecuteTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = dict(bot.CONTROL)
+        for chave in bot.RUN_NOW:
+            bot.RUN_NOW[chave] = False
+
+    def tearDown(self):
+        with bot.CONTROL_LOCK:
+            bot.CONTROL.clear()
+            bot.CONTROL.update(self._orig)
+
+    def test_run_telegram_agenda_ciclo(self):
+        self.assertEqual(bot.panel_execute("run_telegram", {}),
+                         "ciclo do Telegram agendado")
+        self.assertTrue(bot.take_run("telegram"))
+
+    def test_set_flags(self):
+        bot.panel_execute("set_flags", {"flags": {"instagram": False}})
+        self.assertFalse(bot.control_enabled("instagram"))
+
+    def test_delete_delega_para_a_vitrine(self):
+        with mock.patch.object(bot, "delete_from_vitrine",
+                               return_value=(True, "removido; 3 itens")) as dele:
+            result = bot.panel_execute("delete_vitrine",
+                                       {"id": "x", "remove_from_seen": True})
+        self.assertIn("ok:", result)
+        dele.assert_called_once_with("x", True)
+
+    def test_comando_desconhecido_estoura(self):
+        with self.assertRaises(ValueError):
+            bot.panel_execute("explodir", {})
+
+
+class VitrineDeleteTests(unittest.TestCase):
+    def test_remove_e_republica(self):
+        vitrine = [{"id": "a", "price": 10.0}, {"id": "b", "price": 20.0}]
+        with mock.patch.object(bot, "load_json", return_value=vitrine), \
+                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "upload_to_blob",
+                                  return_value="https://blob/v.json") as upload:
+            ok, msg = bot.delete_from_vitrine("a")
+        self.assertTrue(ok)
+        self.assertEqual(save.call_args[0][1],
+                         [{"id": "b", "price": 20.0}])
+        upload.assert_called_once()
+
+    def test_id_inexistente_nao_publica(self):
+        vitrine = [{"id": "a", "price": 10.0}]
+        with mock.patch.object(bot, "load_json", return_value=vitrine), \
+                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "upload_to_blob") as upload:
+            ok, msg = bot.delete_from_vitrine("z")
+        self.assertFalse(ok)
+        self.assertIn("não encontrado", msg)
+        save.assert_not_called()
+        upload.assert_not_called()
+
+    def test_falha_no_blob(self):
+        with mock.patch.object(bot, "load_json",
+                               return_value=[{"id": "a", "price": 10.0}]), \
+                mock.patch.object(bot, "save_json"), \
+                mock.patch.object(bot, "upload_to_blob", return_value=None):
+            ok, msg = bot.delete_from_vitrine("a")
+        self.assertFalse(ok)
+        self.assertIn("Blob", msg)
+
+    def test_remove_do_seen(self):
+        def fake_load(path, default=None):
+            if path == bot.VITRINE_FILE:
+                return [{"id": "a", "price": 10.0}]
+            if path == bot.SEEN_FILE:
+                return ["a", "b"]
+            return default
+
+        with mock.patch.object(bot, "load_json", side_effect=fake_load), \
+                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "upload_to_blob",
+                                  return_value="https://blob/v.json"):
+            ok, _ = bot.delete_from_vitrine("a", remove_from_seen=True)
+        self.assertTrue(ok)
+        self.assertEqual(save.call_args[0][1], ["b"])
+
+
+class ControlGatingTests(unittest.TestCase):
+    def test_schedule_instagram_desligado(self):
+        with mock.patch.object(bot, "control_enabled", return_value=False), \
+                mock.patch.object(bot, "save_json") as save:
+            queued = bot.schedule_instagram({"thumbnail": "x"}, "t", 10, 20)
+        self.assertFalse(queued)
+        save.assert_not_called()
+
+    def test_instagram_cycle_desligado_nao_le_fila(self):
+        with mock.patch.object(bot, "control_enabled", return_value=False), \
+                mock.patch.object(bot, "load_json") as load:
+            bot.instagram_cycle()
+        load.assert_not_called()
+
+    def test_telegram_cycle_desligado_nao_raspa(self):
+        with mock.patch.object(bot, "control_enabled", return_value=False), \
+                mock.patch.object(bot, "proxy_health") as health, \
+                mock.patch.object(bot, "load_json") as load:
+            bot.telegram_cycle()
+        health.assert_not_called()
+        load.assert_not_called()
+
+    def test_cupons_desligados_nao_abrem_pagina(self):
+        with mock.patch.object(bot, "control_enabled", return_value=False), \
+                mock.patch.object(bot, "browser_get") as get:
+            enviados = bot.cupons_cycle()
+        self.assertEqual(enviados, 0)
+        get.assert_not_called()
+
+    def test_collect_products_sem_planilha(self):
+        with mock.patch.object(bot, "fetch_sheet_products") as sheet, \
+                mock.patch.object(bot, "fetch_mercado_livre_products",
+                                  return_value=[]), \
+                mock.patch.object(bot, "fetch_shopee_products", return_value=[]), \
+                mock.patch.object(bot, "MIN_PRICE", 0), \
+                mock.patch.object(bot, "MAX_PRICE", 0), \
+                mock.patch.object(bot, "MIN_DISCOUNT", 0):
+            bot.collect_products(include_sheet=False)
+        sheet.assert_not_called()
+
+
+class PanelStatusTests(unittest.TestCase):
+    def test_campos_do_painel(self):
+        with mock.patch.object(bot, "load_json", return_value=[]):
+            dados = bot.panel_status()
+        for campo in ("updated_at", "online", "flags", "last_telegram",
+                      "last_instagram", "last_listener", "seen", "ig_queue",
+                      "vitrine", "logs"):
+            self.assertIn(campo, dados)
+        self.assertEqual(dados["vitrine"], [])
+        self.assertIn("instagram", dados["flags"])
+
+    def test_vitrine_publica_ignora_item_quebrado(self):
+        itens = [{"id": 1, "title": "a", "price": 10.0, "link": "l",
+                  "image": "i", "time": "t"}, "lixo", {"id": 2, "title": "b"}]
+        with mock.patch.object(bot, "load_json", return_value=itens):
+            pub = bot._vitrine_publica()
+        self.assertEqual([i["id"] for i in pub], ["1", "2"])
+        self.assertEqual(pub[0]["title"], "a")
+
+
+class FirestoreValueTests(unittest.TestCase):
+    def test_roundtrip(self):
+        valores = [True, False, 12, 1.5, "texto", None, [1, "a"],
+                   {"a": True, "b": [2]}]
+        for valor in valores:
+            self.assertEqual(panel_sync._from_value(panel_sync._to_value(valor)),
+                             valor)
+
+    def test_doc_completo(self):
+        doc = {"fields": {"status": {"stringValue": "pending"},
+                          "n": {"integerValue": "3"},
+                          "ok": {"booleanValue": True}}}
+        self.assertEqual(panel_sync._from_doc(doc),
+                         {"status": "pending", "n": 3, "ok": True})
+
+    def test_tipo_desconhecido_vira_none(self):
+        self.assertIsNone(panel_sync._from_value({"geoPointValue": {}}))
+
+
+class PanelSyncTests(unittest.TestCase):
+    def _sync(self):
+        return panel_sync.PanelSync(lambda flags: None,
+                                    lambda tipo, payload: "ok",
+                                    lambda: {"online": True},
+                                    lambda msg: None)
+
+    def test_sem_env_fica_desativado(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            sync = self._sync()
+        self.assertFalse(sync.enabled)
+
+    def test_com_env_fica_ativado(self):
+        env = {"FIREBASE_PROJECT_ID": "p", "FIREBASE_API_KEY": "k",
+               "FIREBASE_BOT_EMAIL": "e", "FIREBASE_BOT_PASSWORD": "s"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            sync = self._sync()
+        self.assertTrue(sync.enabled)
+
+    def test_tick_aplica_flags_e_roda_comandos(self):
+        chamadas = []
+        sync = self._sync()
+        sync.on_flags = lambda flags: chamadas.append(("flags", flags))
+        sync.on_command = lambda tipo, payload: chamadas.append(("cmd", tipo)) or "feito"
+        sync.get_doc = lambda path: {"flags": {"instagram": False}}
+        sync.pending_commands = lambda: [("c1", {"type": "run_telegram"})]
+        sync.write_status = lambda: chamadas.append(("status", None))
+        sync.update_command = (lambda doc_id, status, result:
+                               chamadas.append(("ack", doc_id, status, result)))
+        sync.tick()
+        self.assertEqual(chamadas[0], ("flags", {"instagram": False}))
+        self.assertEqual(chamadas[1], ("cmd", "run_telegram"))
+        self.assertEqual(chamadas[2],
+                         ("ack", "c1", "done", "feito"))
+        self.assertEqual(chamadas[3], ("status", None))
+
+    def test_comando_com_erro_grava_error(self):
+        gravado = []
+        sync = self._sync()
+        sync.on_command = lambda tipo, payload: (_ for _ in ()).throw(RuntimeError("x"))
+        sync.update_command = lambda doc_id, status, result: gravado.append((status, result))
+        sync.run_command("c9", {"type": "delete_vitrine"})
+        self.assertEqual(gravado[0][0], "error")
+        self.assertIn("RuntimeError", gravado[0][1])
+
+    def test_pending_commands_le_nome_do_documento(self):
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = [{
+            "document": {
+                "name": ("projects/p/databases/(default)/documents/"
+                         "panel_commands/abc"),
+                "fields": {"type": {"stringValue": "run_telegram"}},
+            }
+        }]
+        sync = self._sync()
+        sync._request = lambda method, url, **kw: resp
+        self.assertEqual(sync.pending_commands(),
+                         [("abc", {"type": "run_telegram"})])
 
 
 if __name__ == "__main__":
