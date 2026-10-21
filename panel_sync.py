@@ -231,13 +231,23 @@ class PanelSync:
         self.write_status()
 
     def loop(self):
+        erros = 0
+        ultimo = ""
         while True:
             try:
                 self.tick()
+                if erros:
+                    self.log("✅ Painel: sincronização restabelecida.")
+                erros = 0
+                ultimo = ""
             except Exception as exc:
-                self.log(f"⚠️ Painel: {type(exc).__name__}: {exc}")
+                texto = f"{type(exc).__name__}: {exc}"
+                erros += 1
+                if texto != ultimo or erros % 10 == 1:
+                    self.log(f"⚠️ Painel: {texto}")
+                    ultimo = texto
                 self.auth.token = ""
-                time.sleep(max(30, self.interval))
+                time.sleep(min(300, max(30, self.interval) * min(erros, 10)))
                 continue
             time.sleep(self.interval)
 

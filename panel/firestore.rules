@@ -4,12 +4,12 @@ service cloud.firestore {
 
     function admin() {
       return request.auth != null
-        && request.auth.uid in ["COLE_O_UID_DO_ADMIN"];
+        && request.auth.uid in ["sa2hBDSp5gVLHCpYu4tfhMuOayy2"];
     }
 
     function bot() {
       return request.auth != null
-        && request.auth.uid in ["COLE_O_UID_DO_BOT"];
+        && request.auth.uid in ["sa2hBDSp5gVLHCpYu4tfhMuOayy2"];
     }
 
     match /panel_control/{doc} {

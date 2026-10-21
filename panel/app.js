@@ -1,12 +1,3 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import {
-  getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import {
-  getFirestore, doc, onSnapshot, setDoc, addDoc, collection, query, orderBy,
-  limit, serverTimestamp
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-
 const LABELS = {
   channels: "Canais do Telegram",
   sheet: "Planilha",
@@ -16,15 +7,25 @@ const LABELS = {
   telegram: "Publicação no Telegram"
 };
 
+const SDK_VERSION = "10.12.2";
+const SDK = "https://www.gstatic.com/firebasejs/" + SDK_VERSION + "/";
+
 const $ = (id) => document.getElementById(id);
-const config = window.FIREBASE_CONFIG || {};
-let app, db, auth;
+
+let A = null;
+let F = null;
+let db = null;
+let auth = null;
 let flagsAtuais = {};
 let salvandoFlags = false;
 
-function toast(msg) {
+function msg(texto) {
+  $("loginMsg").textContent = texto;
+}
+
+function toast(texto) {
   const el = $("toast");
-  el.textContent = msg;
+  el.textContent = texto;
   el.style.display = "block";
   clearTimeout(toast._t);
   toast._t = setTimeout(() => { el.style.display = "none"; }, 2600);
@@ -35,15 +36,18 @@ function fmtHora(ts) {
   return new Date(ts * 1000).toLocaleString("pt-BR");
 }
 
-function iniciarFirebase() {
-  if (!config.apiKey || !config.projectId) {
-    $("loginMsg").textContent = "Preencha panel/firebase-config.js com os dados do projeto.";
-    return false;
+function mostrarApp(logado) {
+  $("login").classList.toggle("hide", logado);
+  $("app").classList.toggle("hide", !logado);
+  if (logado && auth.currentUser) {
+    $("userEmail").textContent = auth.currentUser.email || "";
   }
-  app = initializeApp(config);
-  auth = getAuth(app);
-  db = getFirestore(app);
-  return true;
+}
+
+function pintarFlags() {
+  document.querySelectorAll("input[data-flag]").forEach((input) => {
+    input.checked = flagsAtuais[input.dataset.flag] !== false;
+  });
 }
 
 function montarFlags() {
@@ -70,19 +74,13 @@ function montarFlags() {
   pintarFlags();
 }
 
-function pintarFlags() {
-  document.querySelectorAll("input[data-flag]").forEach((input) => {
-    input.checked = flagsAtuais[input.dataset.flag] !== false;
-  });
-}
-
 async function salvarFlag(nome, valor) {
   flagsAtuais = { ...flagsAtuais, [nome]: valor };
   salvandoFlags = true;
   try {
-    await setDoc(doc(db, "panel_control", "state"), {
+    await F.setDoc(F.doc(db, "panel_control", "state"), {
       flags: flagsAtuais,
-      updated_at: serverTimestamp(),
+      updated_at: F.serverTimestamp(),
       updated_by: auth.currentUser ? auth.currentUser.email : ""
     }, { merge: true });
     toast(`${LABELS[nome]}: ${valor ? "ligado" : "desligado"}`);
@@ -92,57 +90,6 @@ async function salvarFlag(nome, valor) {
   } finally {
     salvandoFlags = false;
   }
-}
-
-function montarStatus() {
-  onSnapshot(doc(db, "panel_control", "state"), (snap) => {
-    const dados = snap.data() || {};
-    if (dados.flags && typeof dados.flags === "object") {
-      flagsAtuais = dados.flags;
-      if (!salvandoFlags) pintarFlags();
-    }
-  }, (e) => toast("Controle: " + e.message));
-
-  onSnapshot(doc(db, "panel_status", "state"), (snap) => {
-    const d = snap.data() || {};
-    const online = d.online !== false;
-    $("kOnline").innerHTML = "";
-    const dot = document.createElement("span");
-    dot.className = "dot " + (online ? "on" : "off");
-    $("kOnline").appendChild(dot);
-    $("kOnline").appendChild(document.createTextNode(online ? " on" : " off"));
-    $("kSeen").textContent = d.seen ?? "—";
-    $("kQueue").textContent = d.ig_queue ?? "—";
-    $("kVitrine").textContent = (d.vitrine || []).length;
-    $("tTelegram").textContent = fmtHora(d.last_telegram);
-    $("tInstagram").textContent = fmtHora(d.last_instagram);
-    $("tListener").textContent = fmtHora(d.last_listener);
-    $("tUpdated").textContent = fmtHora(d.updated_at);
-    $("logs").textContent = (d.logs || []).join("\n");
-    renderVitrine(d.vitrine || []);
-  }, (e) => toast("Status: " + e.message));
-
-  const q = query(collection(db, "panel_commands"), orderBy("requested_at", "desc"), limit(6));
-  onSnapshot(q, (snap) => {
-    const box = $("comandos");
-    box.textContent = "";
-    if (snap.empty) {
-      box.innerHTML = '<div class="cmd">Nenhum comando ainda.</div>';
-      return;
-    }
-    snap.forEach((docSnap) => {
-      const d = docSnap.data() || {};
-      const div = document.createElement("div");
-      div.className = "cmd " + (d.status || "pending");
-      const titulo = document.createElement("b");
-      titulo.textContent = `${d.type || "?"} — ${d.status || "?"}`;
-      div.appendChild(titulo);
-      if (d.result) {
-        div.appendChild(document.createTextNode(" · " + d.result));
-      }
-      box.appendChild(div);
-    });
-  }, (e) => toast("Comandos: " + e.message));
 }
 
 function renderVitrine(itens) {
@@ -188,11 +135,11 @@ async function removerItem(item, btn) {
   const repostar = $("repostar").checked;
   btn.disabled = true;
   try {
-    await addDoc(collection(db, "panel_commands"), {
+    await F.addDoc(F.collection(db, "panel_commands"), {
       type: "delete_vitrine",
       payload: { id: item.id, remove_from_seen: repostar },
       status: "pending",
-      requested_at: serverTimestamp(),
+      requested_at: F.serverTimestamp(),
       requested_by: auth.currentUser ? auth.currentUser.email : ""
     });
     toast("Remoção solicitada. O bot confirma em segundos.");
@@ -204,11 +151,11 @@ async function removerItem(item, btn) {
 
 async function enviarComando(tipo) {
   try {
-    await addDoc(collection(db, "panel_commands"), {
+    await F.addDoc(F.collection(db, "panel_commands"), {
       type: tipo,
       payload: {},
       status: "pending",
-      requested_at: serverTimestamp(),
+      requested_at: F.serverTimestamp(),
       requested_by: auth.currentUser ? auth.currentUser.email : ""
     });
     toast("Comando enviado; o bot executa no próximo ciclo de sincronização.");
@@ -217,36 +164,126 @@ async function enviarComando(tipo) {
   }
 }
 
+function montarStatus() {
+  F.onSnapshot(F.doc(db, "panel_control", "state"), (snap) => {
+    const dados = snap.data() || {};
+    if (dados.flags && typeof dados.flags === "object") {
+      flagsAtuais = dados.flags;
+      if (!salvandoFlags) pintarFlags();
+    }
+  }, (e) => toast("Controle: " + e.message));
+
+  F.onSnapshot(F.doc(db, "panel_status", "state"), (snap) => {
+    const d = snap.data() || {};
+    const online = d.online !== false;
+    const kOnline = $("kOnline");
+    kOnline.textContent = "";
+    const dot = document.createElement("span");
+    dot.className = "dot " + (online ? "on" : "off");
+    kOnline.appendChild(dot);
+    kOnline.appendChild(document.createTextNode(online ? " on" : " off"));
+    $("kSeen").textContent = d.seen ?? "—";
+    $("kQueue").textContent = d.ig_queue ?? "—";
+    $("kVitrine").textContent = (d.vitrine || []).length;
+    $("tTelegram").textContent = fmtHora(d.last_telegram);
+    $("tInstagram").textContent = fmtHora(d.last_instagram);
+    $("tListener").textContent = fmtHora(d.last_listener);
+    $("tUpdated").textContent = fmtHora(d.updated_at);
+    $("logs").textContent = (d.logs || []).join("\n");
+    renderVitrine(d.vitrine || []);
+  }, (e) => toast("Status: " + e.message));
+
+  const q = F.query(F.collection(db, "panel_commands"),
+                    F.orderBy("requested_at", "desc"), F.limit(6));
+  F.onSnapshot(q, (snap) => {
+    const box = $("comandos");
+    box.textContent = "";
+    if (snap.empty) {
+      box.innerHTML = '<div class="cmd">Nenhum comando ainda.</div>';
+      return;
+    }
+    snap.forEach((docSnap) => {
+      const d = docSnap.data() || {};
+      const div = document.createElement("div");
+      div.className = "cmd " + (d.status || "pending");
+      const titulo = document.createElement("b");
+      titulo.textContent = `${d.type || "?"} — ${d.status || "?"}`;
+      div.appendChild(titulo);
+      if (d.result) {
+        div.appendChild(document.createTextNode(" · " + d.result));
+      }
+      box.appendChild(div);
+    });
+  }, (e) => toast("Comandos: " + e.message));
+}
+
 function ligarEventos() {
   $("btnLogin").addEventListener("click", async () => {
-    $("loginMsg").textContent = "";
+    msg("");
+    if (!auth) {
+      msg("Firebase não inicializado. Veja o erro acima e o console (F12).");
+      return;
+    }
+    const email = $("email").value.trim();
+    const senha = $("password").value;
+    if (!email || !senha) {
+      msg("Preencha e-mail e senha.");
+      return;
+    }
+    $("btnLogin").disabled = true;
     try {
-      await signInWithEmailAndPassword(auth, $("email").value.trim(), $("password").value);
+      await A.signInWithEmailAndPassword(auth, email, senha);
     } catch (e) {
-      $("loginMsg").textContent = e.message;
+      msg("Login falhou: " + e.code + " — " + e.message);
+    } finally {
+      $("btnLogin").disabled = false;
     }
   });
-  $("btnLogout").addEventListener("click", () => signOut(auth));
+
+  $("password").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("btnLogin").click();
+  });
+
+  $("btnLogout").addEventListener("click", () => A.signOut(auth));
+
   document.querySelectorAll("button[data-cmd]").forEach((btn) => {
     btn.addEventListener("click", () => enviarComando(btn.dataset.cmd));
   });
 }
 
-function mostrarApp(logado) {
-  $("login").classList.toggle("hide", logado);
-  $("app").classList.toggle("hide", !logado);
-  if (logado) {
-    $("userEmail").textContent = auth.currentUser.email || "";
+async function iniciar() {
+  ligarEventos();
+  const config = window.FIREBASE_CONFIG || {};
+  const faltando = ["apiKey", "authDomain", "projectId", "appId"]
+    .filter((chave) => !config[chave]);
+  if (faltando.length) {
+    msg("Config incompleta em panel/firebase-config.js. Falta: " + faltando.join(", "));
+    return;
   }
-}
-
-if (iniciarFirebase()) {
-  onAuthStateChanged(auth, (user) => {
+  try {
+    const [appMod, authMod, dbMod] = await Promise.all([
+      import(SDK + "firebase-app.js"),
+      import(SDK + "firebase-auth.js"),
+      import(SDK + "firebase-firestore.js")
+    ]);
+    A = authMod;
+    F = dbMod;
+    const app = appMod.initializeApp(config);
+    auth = A.getAuth(app);
+    db = F.getFirestore(app);
+  } catch (e) {
+    msg("Falha ao carregar o SDK do Firebase: " + e.message +
+        " (verifique a conexão; gstatic.com precisa estar acessível)");
+    return;
+  }
+  A.onAuthStateChanged(auth, (user) => {
     mostrarApp(!!user);
     if (user) {
+      msg("");
       montarFlags();
       montarStatus();
     }
   });
-  ligarEventos();
 }
+
+iniciar();
