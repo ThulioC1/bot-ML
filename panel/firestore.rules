@@ -28,6 +28,7 @@ service cloud.firestore {
       allow update: if bot();
       allow delete: if admin();
     }
+    
 
     match /{document=**} {
       allow read, write: if false;
