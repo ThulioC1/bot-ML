@@ -80,12 +80,14 @@ class FirebaseAuth:
         self.token = ""
         self.refresh_token = ""
         self.expires_at = 0.0
+        self.uid = ""
 
     def _store(self, data):
         self.token = data.get("idToken") or data.get("access_token") or ""
         self.refresh_token = (data.get("refreshToken")
                               or data.get("refresh_token")
                               or self.refresh_token)
+        self.uid = data.get("localId") or data.get("user_id") or self.uid
         expires_in = data.get("expiresIn") or data.get("expires_in") or "3600"
         self.expires_at = time.time() + max(60, int(expires_in) - 120)
 
@@ -255,6 +257,13 @@ class PanelSync:
         if not self.enabled:
             self.log("ℹ️ Painel: Firebase não configurado — painel desativado.")
             return False
+        try:
+            self.auth.bearer()
+            self.log(f"🔑 Painel: bot autenticado como {self.email} "
+                     f"(UID {self.auth.uid or '?'}).")
+        except Exception as exc:
+            self.log(f"⚠️ Painel: login Firebase falhou ({type(exc).__name__}: "
+                     f"{exc}); vou continuar tentando.")
         threading.Thread(target=self.loop, name="panel-sync", daemon=True).start()
         self.log(f"✅ Painel: sincronizando a cada {self.interval}s.")
         return True
