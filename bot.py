@@ -226,6 +226,12 @@ IG_POST_DELAY = _num_env("IG_POST_DELAY", 30)
 CUPOM_POSTS_PER_CYCLE = max(1, int(_num_env("CUPOM_POSTS_PER_CYCLE", 3)))
 CUPOM_DELAY = _num_env("CUPOM_DELAY", 5)
 
+# Canais parceiros: fila e publicação de 3 ofertas a cada 30 min.
+CHANNEL_BATCH_SIZE = max(1, int(_num_env("CHANNEL_BATCH_SIZE", 3)))
+CHANNEL_BATCH_INTERVAL = max(60, int(_num_env("CHANNEL_BATCH_INTERVAL", 1800)))
+CHANNEL_POST_DELAY = _num_env("CHANNEL_POST_DELAY", 8)
+CHANNEL_QUEUE_MAX = max(10, int(_num_env("CHANNEL_QUEUE_MAX", 100)))
+
 CONTROL_LOCK = threading.Lock()
 CONTROL = {
     "channels": True,
@@ -283,6 +289,9 @@ VITRINE_LOCK = threading.Lock()
 OFFSET_FILE = BASE_DIR / "telegram_offset.json"
 STORES_FILE = BASE_DIR / "lojas.json"
 CUPONS_FILE = BASE_DIR / "cupons_enviados.json"
+CHANNEL_QUEUE_FILE = BASE_DIR / "channel_queue.json"
+CHANNEL_STATE_FILE = BASE_DIR / "channel_state.json"
+CHANNEL_LOCK = threading.RLock()
 TEMPLATE_FILE = BASE_DIR / "img" / "template.png"
 
 # Geometria do template, medida em img/template.png (1024x217).
@@ -3868,6 +3877,115 @@ def private_listener():
 # Monitoramento de canais
 # --------------------------------------------------------------------------
 
+def _channel_enqueue(item):
+    key = str(item.get("key") or "")
+    if not key:
+        return False
+    titulo = str(item.get("title") or "")
+    with CHANNEL_LOCK:
+        queue = load_json(CHANNEL_QUEUE_FILE, [])
+        if not isinstance(queue, list):
+            queue = []
+        queue = [q for q in queue if isinstance(q, dict) and q.get("key")]
+        if any(q.get("key") == key for q in queue):
+            return False
+        queue.append(item)
+        queue = queue[-CHANNEL_QUEUE_MAX:]
+        save_json(CHANNEL_QUEUE_FILE, queue)
+        posicao = len(queue)
+    log(f"📥 Canal: '{titulo[:40]}' na fila (posição {posicao}).")
+    return True
+
+
+def _post_channel_offer(item):
+    titulo = str(item.get("title") or "Oferta")
+    linhas = ["🔥 OFERTA EM DESTAQUE", "", f"📦 {titulo}", ""]
+    bloco = price_block(item.get("price"), item.get("old"))
+    if bloco:
+        linhas += bloco.split("\n") + [""]
+    linhas += [FOOTER_TEXT]
+    keyboard = {
+        "inline_keyboard": [[{"text": "💗 Ver Oferta", "url": item.get("link")}]]
+    }
+    ok = send_message("\n".join(linhas), photo_url=item.get("image") or None,
+                      reply_markup=keyboard)
+    if not ok:
+        return False
+    save_to_vitrine({
+        "id": item.get("id") or ("ch_" + str(item.get("key"))),
+        "title": titulo,
+        "price": item.get("price"),
+        "original_price": item.get("old"),
+        "link": item.get("link"),
+        "image": item.get("image") or "",
+    })
+    return True
+
+
+def publish_channel_batch():
+    if not control_enabled("channels"):
+        return 0
+    with CHANNEL_LOCK:
+        queue = load_json(CHANNEL_QUEUE_FILE, [])
+        if not isinstance(queue, list):
+            queue = []
+        queue = [q for q in queue if isinstance(q, dict) and q.get("key")
+                 and q.get("link")]
+    lote = queue[:CHANNEL_BATCH_SIZE]
+    if not lote:
+        return 0
+    enviados = 0
+    for indice, item in enumerate(lote):
+        titulo = str(item.get("title") or "")[:40]
+        try:
+            ok = _post_channel_offer(item)
+        except Exception as exc:
+            log(f"⚠️ Canal: falha ao publicar '{titulo}': {type(exc).__name__}: {exc}")
+            ok = False
+        if ok:
+            enviados += 1
+            with CHANNEL_LOCK:
+                atual = load_json(CHANNEL_QUEUE_FILE, [])
+                if not isinstance(atual, list):
+                    atual = []
+                atual = [q for q in atual if not (isinstance(q, dict)
+                                                  and q.get("key") == item.get("key"))]
+                save_json(CHANNEL_QUEUE_FILE, atual)
+            log(f"✅ Canal: '{titulo}' publicado.")
+        else:
+            log(f"⏭️ Canal: '{titulo}' mantido na fila.")
+        if indice < len(lote) - 1 and CHANNEL_POST_DELAY > 0:
+            time.sleep(CHANNEL_POST_DELAY)
+    return enviados
+
+
+def channel_publisher_loop():
+    if not SOURCE_CHANNELS:
+        return
+    minutos = int(CHANNEL_BATCH_INTERVAL // 60) or 1
+    log(f"📤 Canal: até {CHANNEL_BATCH_SIZE} oferta(s) a cada {minutos} min.")
+    time.sleep(5)
+    while True:
+        state = load_json(CHANNEL_STATE_FILE, {})
+        try:
+            ultimo = float(state.get("last_batch_at") or 0)
+        except (TypeError, ValueError):
+            ultimo = 0.0
+        espera = ultimo + CHANNEL_BATCH_INTERVAL - time.time()
+        if espera > 0:
+            time.sleep(min(espera, CHANNEL_BATCH_INTERVAL))
+            continue
+        try:
+            publicados = publish_channel_batch()
+        except Exception as exc:
+            log(f"⚠️ Canal: publicador falhou: {type(exc).__name__}: {exc}")
+            publicados = 0
+        if publicados:
+            save_json(CHANNEL_STATE_FILE, {"last_batch_at": time.time()})
+        else:
+            time.sleep(CHANNEL_BATCH_INTERVAL)
+
+
 def channel_listener():
     """Espelha ofertas de canais do Telegram. Opcional: requer telethon + sessão já autenticada."""
     api_id, api_hash = env("API_ID"), env("API_HASH")
@@ -3940,6 +4058,7 @@ def channel_listener():
             image = data.get("image") or ""
             price = price or data.get("price")
             old_price = old_price or data.get("original_price")
+            canonical = data.get("link") or product_url
 
             if not image and event.photo:
                 log("⏭️ Canal: sem imagem oficial; oferta descartada para não "
@@ -3961,24 +4080,18 @@ def channel_listener():
                 notify_link_failure(product_url, title, link_aviso)
                 return
 
-            # 4. Post montado do zero: titulo + preco antigo + preco atual.
-            #    NAO repostamos o texto do canal (era ele que trazia o titulo
-            #    pela segunda vez, a frase de marketing e o link gigante), e
-            #    NAO imprimimos a URL — ela vai so no botao, que e o que o
-            #    usuario pediu: link embutido, sem aquela parede de texto.
-            lines = ["🔥 OFERTA EM DESTAQUE", "", f"📦 {title}", ""]
-            block = price_block(price, old_price)
-            if block:
-                lines += block.split("\n") + [""]
-            lines += [FOOTER_TEXT]
-            text = "\n".join(lines)
-            keyboard = {
-                "inline_keyboard": [[{"text": "💗 Ver Oferta", "url": link}]]
-            }
-            send_message(text, photo_url=image, reply_markup=keyboard)
-            save_to_vitrine({"id": "ch_" + hashlib.md5(link.encode()).hexdigest()[:10],
-                             "title": title, "price": price, "original_price": old_price,
-                             "link": link, "image": image or ""})
+            key = hashlib.md5(canonical.split("?")[0].encode()).hexdigest()[:12]
+            _channel_enqueue({
+                "key": key,
+                "id": "ch_" + key,
+                "title": title,
+                "price": price,
+                "old": old_price,
+                "image": image or "",
+                "link": link,
+                "url": canonical,
+                "queued_at": int(time.time()),
+            })
 
         log(f"👂 Telethon conectado: {', '.join(SOURCE_CHANNELS)}")
         try:
@@ -4188,6 +4301,7 @@ def main():
 
     threading.Thread(target=private_listener, daemon=True).start()
     threading.Thread(target=channel_listener, daemon=True).start()
+    threading.Thread(target=channel_publisher_loop, daemon=True).start()
 
     try:
         from panel_sync import start_panel_sync

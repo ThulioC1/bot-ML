@@ -39,6 +39,8 @@ seen.json
 vitrine.json
 ig_queue.json
 ig_seen.json
+channel_queue.json
+channel_state.json
 telegram_offset.json
 link_cache.json
 

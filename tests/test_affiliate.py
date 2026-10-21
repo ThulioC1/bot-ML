@@ -933,5 +933,52 @@ class PanelSyncTests(unittest.TestCase):
                          [("abc", {"type": "run_telegram"})])
 
 
+class ChannelOfferTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.object(bot, "CHANNEL_QUEUE_FILE",
+                                    Path(self.tmp.name) / "queue.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _item(self, key, price=80.0, old=100.0):
+        return {"key": key, "id": "ch_" + key, "title": key, "price": price,
+                "old": old, "image": "https://img",
+                "link": "https://link/" + key, "url": "https://p/" + key}
+
+    def test_fila_mantem_ordem_e_evita_repetida(self):
+        self.assertTrue(bot._channel_enqueue(self._item("a")))
+        self.assertTrue(bot._channel_enqueue(self._item("b")))
+        self.assertFalse(bot._channel_enqueue(self._item("b")))
+        queue = bot.load_json(bot.CHANNEL_QUEUE_FILE, [])
+        self.assertEqual([q["key"] for q in queue], ["a", "b"])
+
+    def test_lote_publica_os_primeiros(self):
+        for key in ("a", "b", "c"):
+            bot._channel_enqueue(self._item(key))
+        with mock.patch.object(bot, "CHANNEL_BATCH_SIZE", 2), \
+                mock.patch.object(bot, "CHANNEL_POST_DELAY", 0), \
+                mock.patch.object(bot, "_post_channel_offer",
+                                  return_value=True) as post:
+            enviados = bot.publish_channel_batch()
+        self.assertEqual(enviados, 2)
+        self.assertEqual([c[0][0]["key"] for c in post.call_args_list],
+                         ["a", "b"])
+        restante = bot.load_json(bot.CHANNEL_QUEUE_FILE, [])
+        self.assertEqual([q["key"] for q in restante], ["c"])
+
+    def test_vitrine_so_depois_do_envio(self):
+        item = self._item("a")
+        with mock.patch.object(bot, "send_message", return_value=False), \
+                mock.patch.object(bot, "save_to_vitrine") as vitrine:
+            self.assertFalse(bot._post_channel_offer(item))
+        vitrine.assert_not_called()
+        with mock.patch.object(bot, "send_message", return_value=True), \
+                mock.patch.object(bot, "save_to_vitrine") as vitrine:
+            self.assertTrue(bot._post_channel_offer(item))
+        vitrine.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
