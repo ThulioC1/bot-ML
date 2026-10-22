@@ -933,6 +933,21 @@ class PanelSyncTests(unittest.TestCase):
                          [("abc", {"type": "run_telegram"})])
 
 
+class LogRedactionTests(unittest.TestCase):
+    def test_token_do_telegram_nao_vaza_na_url(self):
+        with mock.patch.object(bot, "TELEGRAM_TOKEN", "123456:SEGREDO123456"):
+            texto = bot._redact(
+                "url: /bot123456:SEGREDO123456/getUpdates?offset=1")
+        self.assertNotIn("SEGREDO123456", texto)
+        self.assertIn("***", texto)
+
+    def test_segredo_vindo_do_ambiente_nao_vaza(self):
+        with mock.patch.dict(os.environ, {"API_HASH": "hash-super-secreto"}):
+            texto = bot._redact("falhou com hash-super-secreto no login")
+        self.assertNotIn("hash-super-secreto", texto)
+        self.assertIn("***", texto)
+
+
 class ChannelOfferTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -56,9 +56,23 @@ _setup_stdout()
 
 LOG_BUFFER = deque(maxlen=200)
 
+_SECRET_NAMES = ("TELEGRAM_TOKEN", "IG_ACCESS_TOKEN", "BLOB_READ_WRITE_TOKEN",
+                 "SHOPEE_SECRET", "API_HASH")
+
+
+def _redact(text):
+    """Evita que tokens vazem nos logs (inclusive dentro de URLs de erro)."""
+    text = str(text)
+    for name in _SECRET_NAMES:
+        value = globals().get(name) or os.getenv(name, "")
+        value = (value or "").strip().strip('"').strip("'")
+        if len(value) >= 8:
+            text = text.replace(value, "***")
+    return text
+
 
 def log(msg):
-    line = f"[{time.strftime('%d/%m %H:%M:%S')}] {msg}"
+    line = f"[{time.strftime('%d/%m %H:%M:%S')}] {_redact(msg)}"
     print(line, flush=True)
     LOG_BUFFER.append(line)
 
@@ -3847,12 +3861,23 @@ def private_listener():
             save_json(OFFSET_FILE, offset)
             log(f"   Offset inicial: {offset} (mensagens antigas ignoradas)")
 
+    falhas = 0
+    ultimo_aviso = 0.0
     while True:
+        if not NET_STATE.get("online", True):
+            time.sleep(15)
+            continue
         try:
             resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
                                 params={"offset": offset, "timeout": 30}, timeout=60)
             if resp.status_code != 200:
-                time.sleep(5)
+                falhas += 1
+                agora = time.time()
+                if falhas == 1 or agora - ultimo_aviso >= 300:
+                    detalhe = _redact(resp.text)[:120]
+                    log(f"⚠️ Listener privado: HTTP {resp.status_code} {detalhe}")
+                    ultimo_aviso = agora
+                time.sleep(min(60, 5 * (2 ** min(falhas - 1, 4))))
                 continue
 
             for update in resp.json().get("result", []):
@@ -3868,9 +3893,18 @@ def private_listener():
 
             if offset:
                 save_json(OFFSET_FILE, offset)
+            if falhas:
+                log("✅ Listener privado: conexão restabelecida.")
+                falhas = 0
+                ultimo_aviso = 0.0
         except Exception as exc:
-            log(f"⚠️ Listener privado: {type(exc).__name__}: {exc}")
-            time.sleep(5)
+            falhas += 1
+            agora = time.time()
+            if falhas == 1 or agora - ultimo_aviso >= 300:
+                detalhe = _redact(str(exc))[:200]
+                log(f"⚠️ Listener privado: {type(exc).__name__}: {detalhe}")
+                ultimo_aviso = agora
+            time.sleep(min(60, 5 * (2 ** min(falhas - 1, 4))))
 
 
 # --------------------------------------------------------------------------
