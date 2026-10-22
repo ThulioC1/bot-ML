@@ -3993,6 +3993,26 @@ def publish_channel_batch():
     return enviados
 
 
+def _channel_schedule():
+    """Le a agenda do publicador: (estado, ultimo lote, proximo lote)."""
+    with CHANNEL_LOCK:
+        state = load_json(CHANNEL_STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+
+    def _ts(nome):
+        try:
+            return float(state.get(nome) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ultimo = _ts("last_batch_at")
+    proximo = _ts("next_batch_at")
+    if not proximo and ultimo:
+        proximo = ultimo + CHANNEL_BATCH_INTERVAL
+    return state, ultimo, proximo
+
+
 def channel_publisher_loop():
     if not SOURCE_CHANNELS:
         return
@@ -4000,24 +4020,24 @@ def channel_publisher_loop():
     log(f"📤 Canal: até {CHANNEL_BATCH_SIZE} oferta(s) a cada {minutos} min.")
     time.sleep(5)
     while True:
-        state = load_json(CHANNEL_STATE_FILE, {})
-        try:
-            ultimo = float(state.get("last_batch_at") or 0)
-        except (TypeError, ValueError):
-            ultimo = 0.0
-        espera = ultimo + CHANNEL_BATCH_INTERVAL - time.time()
-        if espera > 0:
-            time.sleep(min(espera, CHANNEL_BATCH_INTERVAL))
+        if not control_enabled("channels"):
+            time.sleep(15)
+            continue
+        _, ultimo, proximo = _channel_schedule()
+        agora = time.time()
+        if proximo and proximo > agora:
+            time.sleep(min(proximo - agora, CHANNEL_BATCH_INTERVAL))
             continue
         try:
             publicados = publish_channel_batch()
         except Exception as exc:
             log(f"⚠️ Canal: publicador falhou: {type(exc).__name__}: {exc}")
             publicados = 0
-        if publicados:
-            save_json(CHANNEL_STATE_FILE, {"last_batch_at": time.time()})
-        else:
-            time.sleep(CHANNEL_BATCH_INTERVAL)
+        agora = time.time()
+        estado = {"last_batch_at": agora if publicados else ultimo,
+                  "next_batch_at": agora + CHANNEL_BATCH_INTERVAL}
+        with CHANNEL_LOCK:
+            save_json(CHANNEL_STATE_FILE, estado)
 
 
 def channel_listener():
@@ -4250,17 +4270,40 @@ def _vitrine_publica():
     return saida
 
 
+def _proximo_ciclo(ultimo, intervalo, ativo, agora):
+    """Horario do proximo ciclo; None quando a funcao esta desligada."""
+    if not ativo:
+        return None
+    try:
+        ultimo = float(ultimo or 0)
+    except (TypeError, ValueError):
+        ultimo = 0.0
+    return ultimo + intervalo if ultimo else agora
+
+
 def panel_status():
     fila = load_json(BASE_DIR / "ig_queue.json", [])
     vistos = load_json(SEEN_FILE, [])
+    flags = control_snapshot()
+    agora = time.time()
+    _, _, proximo_lote = _channel_schedule()
     return {
-        "updated_at": int(time.time()),
+        "updated_at": int(agora),
         "online": bool(NET_STATE.get("online", True)),
         "net": NET_STATE.get("msg", ""),
-        "flags": control_snapshot(),
+        "flags": flags,
         "last_telegram": PANEL_STATE.get("last_telegram", 0.0),
         "last_instagram": PANEL_STATE.get("last_instagram", 0.0),
         "last_listener": PANEL_STATE.get("last_listener", 0.0),
+        "next_telegram": _proximo_ciclo(
+            PANEL_STATE.get("last_telegram", 0.0), INTERVAL_TELEGRAM,
+            flags.get("telegram", True), agora),
+        "next_instagram": _proximo_ciclo(
+            PANEL_STATE.get("last_instagram", 0.0), INTERVAL_INSTAGRAM,
+            flags.get("instagram", True), agora),
+        "next_channels": ((proximo_lote or agora)
+                          if flags.get("channels", True) and SOURCE_CHANNELS
+                          else None),
         "seen": len(vistos) if isinstance(vistos, list) else 0,
         "ig_queue": len(fila) if isinstance(fila, list) else 0,
         "vitrine": _vitrine_publica(),

@@ -79,8 +79,11 @@
   .login { max-width: 360px; margin: 12vh auto; }
   .login .card { display: grid; gap: 10px; }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .row > span:last-child { text-align: right; }
   .row:last-child { border-bottom: 0; }
   .muted { color: var(--muted); font-size: 12px; }
+  .next { font-size: 12px; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .next.off { color: var(--muted); }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
   .kpi { background: #11141a; border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
   .kpi b { display: block; font-size: 18px; margin-top: 4px; }
@@ -153,9 +156,9 @@
         <div class="kpi"><span class="muted">Fila IG</span><b id="kQueue">—</b></div>
         <div class="kpi"><span class="muted">Vitrine</span><b id="kVitrine">—</b></div>
       </div>
-      <div class="row"><span class="muted">Telegram</span><span id="tTelegram">—</span></div>
-      <div class="row"><span class="muted">Instagram</span><span id="tInstagram">—</span></div>
-      <div class="row"><span class="muted">Canais</span><span id="tListener">—</span></div>
+      <div class="row"><span class="muted">Telegram</span><span><span id="tTelegram">—</span> <span class="next" id="cTelegram"></span></span></div>
+      <div class="row"><span class="muted">Instagram</span><span><span id="tInstagram">—</span> <span class="next" id="cInstagram"></span></span></div>
+      <div class="row"><span class="muted">Canais</span><span><span id="tListener">—</span> <span class="next" id="cChannels"></span></span></div>
       <div class="row"><span class="muted">Atualizado</span><span id="tUpdated">—</span></div>
     </section>
 

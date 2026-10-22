@@ -38,6 +38,60 @@ function fmtHora(ts) {
   return new Date(ts * 1000).toLocaleString("pt-BR");
 }
 
+const proximos = {
+  telegram: { ts: 0, ativo: false, rotulo: "próximo em" },
+  instagram: { ts: 0, ativo: false, rotulo: "próximo em" },
+  channels: { ts: 0, ativo: false, rotulo: "lote em" }
+};
+let offlineAtual = false;
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function fmtContagem(segundos) {
+  const total = Math.max(0, Math.ceil(segundos));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return (h ? h + ":" + pad2(m) : String(m)) + ":" + pad2(s);
+}
+
+function definirProximo(nome, ts, ativo) {
+  proximos[nome].ts = Number(ts) || 0;
+  proximos[nome].ativo = !!ativo;
+}
+
+function pintarContagem(id, item) {
+  const el = $(id);
+  if (!item.ativo) {
+    el.textContent = "desligado";
+    el.classList.add("off");
+    return;
+  }
+  if (offlineAtual) {
+    el.textContent = "offline";
+    el.classList.add("off");
+    return;
+  }
+  if (!item.ts) {
+    el.textContent = "—";
+    el.classList.add("off");
+    return;
+  }
+  const seg = item.ts - Date.now() / 1000;
+  el.textContent = seg <= 0
+    ? "agora"
+    : item.rotulo + " " + fmtContagem(seg);
+  el.classList.remove("off");
+}
+
+function tickContagens() {
+  pintarContagem("cTelegram", proximos.telegram);
+  pintarContagem("cInstagram", proximos.instagram);
+  pintarContagem("cChannels", proximos.channels);
+}
+
 function mostrarApp(logado) {
   $("login").classList.toggle("hide", logado);
   $("app").classList.toggle("hide", !logado);
@@ -78,6 +132,10 @@ function montarFlags() {
 
 async function salvarFlag(nome, valor) {
   flagsAtuais = { ...flagsAtuais, [nome]: valor };
+  if (proximos[nome]) {
+    proximos[nome].ativo = valor;
+    tickContagens();
+  }
   salvandoFlags = true;
   try {
     await F.setDoc(F.doc(db, "panel_control", "state"), {
@@ -178,6 +236,7 @@ function montarStatus() {
   F.onSnapshot(F.doc(db, "panel_status", "state"), (snap) => {
     const d = snap.data() || {};
     const online = d.online !== false;
+    offlineAtual = !online;
     const kOnline = $("kOnline");
     kOnline.textContent = "";
     const dot = document.createElement("span");
@@ -191,6 +250,11 @@ function montarStatus() {
     $("tInstagram").textContent = fmtHora(d.last_instagram);
     $("tListener").textContent = fmtHora(d.last_listener);
     $("tUpdated").textContent = fmtHora(d.updated_at);
+    const flags = (d.flags && typeof d.flags === "object") ? d.flags : flagsAtuais;
+    definirProximo("telegram", d.next_telegram, flags.telegram !== false);
+    definirProximo("instagram", d.next_instagram, flags.instagram !== false);
+    definirProximo("channels", d.next_channels, flags.channels !== false);
+    tickContagens();
     $("logs").textContent = (d.logs || []).join("\n");
     renderVitrine(d.vitrine || []);
   }, (e) => toast("Status: " + e.message));
@@ -288,4 +352,5 @@ async function iniciar() {
   });
 }
 
+setInterval(tickContagens, 1000);
 iniciar();

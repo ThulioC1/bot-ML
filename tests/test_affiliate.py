@@ -839,11 +839,48 @@ class PanelStatusTests(unittest.TestCase):
         with mock.patch.object(bot, "load_json", return_value=[]):
             dados = bot.panel_status()
         for campo in ("updated_at", "online", "flags", "last_telegram",
-                      "last_instagram", "last_listener", "seen", "ig_queue",
+                      "last_instagram", "last_listener", "next_telegram",
+                      "next_instagram", "next_channels", "seen", "ig_queue",
                       "vitrine", "logs"):
             self.assertIn(campo, dados)
         self.assertEqual(dados["vitrine"], [])
         self.assertIn("instagram", dados["flags"])
+
+    def test_proximos_ciclos(self):
+        agora = 1_700_000_000.0
+
+        def fake_load(path, default=None):
+            if Path(path) == bot.CHANNEL_STATE_FILE:
+                return {"last_batch_at": agora - 100,
+                        "next_batch_at": agora + 1700}
+            return default
+
+        with mock.patch.object(bot, "PANEL_STATE",
+                               {"last_telegram": agora - 60,
+                                "last_instagram": agora - 120,
+                                "last_listener": agora - 30}), \
+                mock.patch.object(bot, "INTERVAL_TELEGRAM", 3600), \
+                mock.patch.object(bot, "INTERVAL_INSTAGRAM", 10800), \
+                mock.patch.object(bot, "SOURCE_CHANNELS", ["@a"]), \
+                mock.patch.object(bot, "load_json", side_effect=fake_load), \
+                mock.patch.object(bot.time, "time", return_value=agora), \
+                mock.patch.dict(bot.CONTROL, {"telegram": True,
+                                              "instagram": True,
+                                              "channels": True}):
+            dados = bot.panel_status()
+        self.assertEqual(dados["next_telegram"], agora - 60 + 3600)
+        self.assertEqual(dados["next_instagram"], agora - 120 + 10800)
+        self.assertEqual(dados["next_channels"], agora + 1700)
+
+    def test_proximos_desligados(self):
+        with mock.patch.object(bot, "load_json", return_value=[]), \
+                mock.patch.dict(bot.CONTROL, {"telegram": False,
+                                              "instagram": False,
+                                              "channels": False}):
+            dados = bot.panel_status()
+        self.assertIsNone(dados["next_telegram"])
+        self.assertIsNone(dados["next_instagram"])
+        self.assertIsNone(dados["next_channels"])
 
     def test_vitrine_publica_ignora_item_quebrado(self):
         itens = [{"id": 1, "title": "a", "price": 10.0, "link": "l",
@@ -982,6 +1019,18 @@ class ChannelOfferTests(unittest.TestCase):
                          ["a", "b"])
         restante = bot.load_json(bot.CHANNEL_QUEUE_FILE, [])
         self.assertEqual([q["key"] for q in restante], ["c"])
+
+    def test_agenda_usa_next_e_cai_para_intervalo(self):
+        state_file = Path(self.tmp.name) / "state.json"
+        with mock.patch.object(bot, "CHANNEL_STATE_FILE", state_file):
+            bot.save_json(state_file, {"last_batch_at": 100})
+            _, ultimo, proximo = bot._channel_schedule()
+            self.assertEqual(ultimo, 100)
+            self.assertEqual(proximo, 100 + bot.CHANNEL_BATCH_INTERVAL)
+            bot.save_json(state_file, {"last_batch_at": 100,
+                                       "next_batch_at": 500})
+            _, _, proximo = bot._channel_schedule()
+            self.assertEqual(proximo, 500)
 
     def test_vitrine_so_depois_do_envio(self):
         item = self._item("a")
