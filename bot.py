@@ -310,6 +310,8 @@ SEEN_FILE = BASE_DIR / "seen.json"
 IG_SEEN_FILE = BASE_DIR / "ig_seen.json"
 VITRINE_FILE = BASE_DIR / "vitrine.json"
 VITRINE_LOCK = threading.Lock()
+IG_QUEUE_FILE = BASE_DIR / "ig_queue.json"
+IG_QUEUE_LOCK = threading.RLock()
 OFFSET_FILE = BASE_DIR / "telegram_offset.json"
 STORES_FILE = BASE_DIR / "lojas.json"
 CUPONS_FILE = BASE_DIR / "cupons_enviados.json"
@@ -1520,6 +1522,65 @@ def post_instagram_comment(media_id, message):
     except Exception as exc:
         log(f"⚠️ Instagram comentário: {type(exc).__name__}: {exc}")
     return False
+
+
+def instagram_diagnostico():
+    """Confere token e permissão de comentários sem publicar nada."""
+    if not IG_ACCESS_TOKEN:
+        return "❌ IG_ACCESS_TOKEN ausente no .env."
+    base = "https://graph.instagram.com/v18.0"
+    linhas = []
+    try:
+        me = requests.get(
+            base + "/me",
+            params={"fields": "id,username", "access_token": IG_ACCESS_TOKEN},
+            timeout=25,
+        ).json()
+    except Exception as exc:
+        return f"❌ Instagram: {type(exc).__name__}: {exc}"
+    if not isinstance(me, dict) or "error" in me:
+        erro = (me or {}).get("error") or me
+        return f"❌ Token inválido: {str(erro)[:220]}"
+    linhas.append(f"✅ Token válido: @{me.get('username')} (id {me.get('id')})")
+
+    media_id = ""
+    try:
+        media = requests.get(
+            base + "/me/media",
+            params={"fields": "id,timestamp", "limit": 1,
+                    "access_token": IG_ACCESS_TOKEN},
+            timeout=25,
+        ).json()
+        dados = (media or {}).get("data") or []
+        if dados:
+            media_id = dados[0].get("id") or ""
+            linhas.append(f"🖼️ Último post: {media_id} ({dados[0].get('timestamp', '')})")
+    except Exception as exc:
+        linhas.append(f"⚠️ Não consegui ler a mídia: {type(exc).__name__}: {exc}")
+
+    if not media_id:
+        linhas.append("⚠️ Sem post para testar a leitura de comentários.")
+        return "\n".join(linhas)
+
+    try:
+        resp = requests.get(
+            f"{base}/{media_id}/comments",
+            params={"fields": "id", "limit": 1, "access_token": IG_ACCESS_TOKEN},
+            timeout=25,
+        ).json()
+    except Exception as exc:
+        linhas.append(f"❌ Comentários: {type(exc).__name__}: {exc}")
+        return "\n".join(linhas)
+
+    erro = (resp or {}).get("error") if isinstance(resp, dict) else None
+    if erro:
+        linhas.append(f"❌ Comentários: código {erro.get('code')} — "
+                      f"{erro.get('message')}")
+        linhas.append("   Falta a permissão instagram_business_manage_comments "
+                      "no app/token.")
+    else:
+        linhas.append("✅ Autorização de comentários OK (leitura funcionou).")
+    return "\n".join(linhas)
 
 
 def post_to_instagram(image_url, caption, comment=None):
@@ -3364,6 +3425,57 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
     return ok
 
 
+def _ig_queue_qid(item):
+    """Identificador estável para o painel remover um item da fila."""
+    if not isinstance(item, dict):
+        return ""
+    qid = str(item.get("qid") or "").strip()
+    if qid:
+        return qid
+    base = "|".join(str(item.get(k) or "") for k in ("id", "title", "image", "price"))
+    return "q_" + hashlib.md5(base.encode()).hexdigest()[:12]
+
+
+def _ig_queue_publica():
+    """Versão enxuta da fila para o painel (sem quebrar se o JSON estiver sujo)."""
+    with IG_QUEUE_LOCK:
+        fila = load_json(IG_QUEUE_FILE, [])
+    if not isinstance(fila, list):
+        return []
+    saida = []
+    for item in fila[:10]:
+        if not isinstance(item, dict):
+            continue
+        saida.append({
+            "qid": _ig_queue_qid(item),
+            "id": str(item.get("id") or "")[:80],
+            "title": str(item.get("title") or "")[:120],
+            "price": item.get("price"),
+            "old": item.get("old"),
+            "image": str(item.get("image") or ""),
+            "link": str(item.get("link") or ""),
+        })
+    return saida
+
+
+def delete_from_ig_queue(qid):
+    """Remove um item da fila do Instagram sem tocar na vitrine."""
+    qid = str(qid or "").strip()
+    if not qid:
+        return False, "item não informado"
+    with IG_QUEUE_LOCK:
+        fila = load_json(IG_QUEUE_FILE, [])
+        if not isinstance(fila, list):
+            return False, "fila inválida"
+        restantes = [item for item in fila
+                     if not (isinstance(item, dict) and _ig_queue_qid(item) == qid)]
+        if len(restantes) == len(fila):
+            return False, "item não encontrado"
+        save_json(IG_QUEUE_FILE, restantes)
+    log(f"🗑️ Fila do Instagram: {qid} removido ({len(restantes)} restantes).")
+    return True, f"removido; {len(restantes)} item(ns) restante(s)"
+
+
 def schedule_instagram(product, title, price, old, link=""):
     """Enfileira o post do Instagram. Devolve True se entrou na fila."""
     if not control_enabled("instagram"):
@@ -3382,12 +3494,51 @@ def schedule_instagram(product, title, price, old, link=""):
     if not image:
         log("⏭️ Instagram: produto sem imagem.")
         return False
-    queue = load_json(BASE_DIR / "ig_queue.json", [])
-    queue.append({"title": title, "price": price, "old": old, "image": image,
-                  "pct": pct, "link": link or ""})
-    save_json(BASE_DIR / "ig_queue.json", queue[-10:])
+    qid = "q_" + hashlib.md5(
+        f"{product.get('id') or ''}|{title}|{image}|{time.time()}".encode()
+    ).hexdigest()[:12]
+    with IG_QUEUE_LOCK:
+        queue = load_json(IG_QUEUE_FILE, [])
+        if not isinstance(queue, list):
+            queue = []
+        queue.append({"qid": qid, "id": product.get("id") or "", "title": title,
+                      "price": price, "old": old, "image": image, "pct": pct,
+                      "link": link or ""})
+        save_json(IG_QUEUE_FILE, queue[-10:])
     log(f"🖼️ Arte do post '{title[:32]}' entrou na fila do Instagram.")
     return True
+
+
+def _ig_queue_link(item):
+    """Link para o 1º comentário; recupera itens antigos pela vitrine.
+
+    A fila antiga era gravada sem `link`. Para não perder o comentário desses
+    posts, procura o mesmo item na vitrine por id, imagem ou título+preço.
+    """
+    link = (item.get("link") or "").strip()
+    if link:
+        return link
+    pid = str(item.get("id") or "").strip()
+    titulo = (item.get("title") or "").strip().casefold()
+    imagem = (item.get("image") or "").strip()
+    preco = item.get("price")
+    vitrine = load_json(VITRINE_FILE, [])
+    if not isinstance(vitrine, list):
+        return ""
+    for v in vitrine:
+        if not isinstance(v, dict) or not v.get("link"):
+            continue
+        if pid and str(v.get("id")) == pid:
+            return v["link"]
+        if imagem and v.get("image") == imagem:
+            return v["link"]
+        if titulo and (v.get("title") or "").strip().casefold() == titulo:
+            try:
+                if preco is None or abs(float(v.get("price")) - float(preco)) < 0.01:
+                    return v["link"]
+            except (TypeError, ValueError):
+                return v["link"]
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -3630,6 +3781,7 @@ HELP = (
     "/preco <valor> <link> — monta o post com preço manual\n"
     "/buscar <termo> — busca ofertas do termo (essas sim usam o gerador)\n"
     "/cupons — busca cupons ativos no ML e publica os novos no grupo\n"
+    "/igcheck — (dono) confere token e permissão de comentários do Instagram\n"
     "/diagcupons — (dono) captura o HTML da página de cupons do ML\n"
     "/lojas — quais lojas do ML o bot está usando\n"
     "/status — diagnóstico das fontes\n"
@@ -3742,6 +3894,14 @@ def handle_private_message(message):
             resposta = ("ℹ️ Nenhum cupom novo. Se a página pedir login, rode "
                         "`python bot.py --login-browser` e tente de novo.")
         send_message(resposta, chat_id=chat_id, reply_to=message_id)
+        return
+
+    if text.startswith("/igcheck"):
+        admin = env("ADMIN_CHAT_ID")
+        if admin and str(chat_id) != str(admin):
+            send_message("⛔ Comando restrito ao dono.", chat_id=chat_id, reply_to=message_id)
+            return
+        send_message(instagram_diagnostico(), chat_id=chat_id, reply_to=message_id)
         return
 
     if text.startswith("/diagcupons"):
@@ -4242,15 +4402,20 @@ def instagram_cycle():
         log("⏸️ Instagram desligado no painel.")
         return
     PANEL_STATE["last_instagram"] = time.time()
-    queue = load_json(BASE_DIR / "ig_queue.json", [])
-    if not queue:
-        log("📸 Instagram: fila vazia.")
-        return
     enviados = 0
-    while queue and enviados < IG_POSTS_PER_CYCLE:
+    while enviados < IG_POSTS_PER_CYCLE:
+        # Relê a fila a cada post: se o painel excluir um item enquanto o bot
+        # espera entre publicações, ele não deve ser postado mesmo assim.
+        with IG_QUEUE_LOCK:
+            queue = load_json(IG_QUEUE_FILE, [])
+        if not isinstance(queue, list) or not queue:
+            if not enviados:
+                log("📸 Instagram: fila vazia.")
+            break
         item = queue[0]
+        qid = _ig_queue_qid(item)
         pct = item.get("pct")
-        link = item.get("link") or ""
+        link = _ig_queue_link(item)
         linhas = [f"🔥 {item['title']}", ""]
         bloco = price_block(item.get("price"), item.get("old"))
         if bloco:
@@ -4262,10 +4427,15 @@ def instagram_cycle():
         if not post_to_instagram(public_url, caption, comment=link or None):
             log("⏭️ Post do Instagram não concluído; item mantido na fila.")
             break
-        queue = queue[1:]
-        save_json(BASE_DIR / "ig_queue.json", queue)
+        with IG_QUEUE_LOCK:
+            atual = load_json(IG_QUEUE_FILE, [])
+            if not isinstance(atual, list):
+                atual = []
+            atual = [x for x in atual
+                     if not (isinstance(x, dict) and _ig_queue_qid(x) == qid)]
+            save_json(IG_QUEUE_FILE, atual)
         enviados += 1
-        if queue and enviados < IG_POSTS_PER_CYCLE and IG_POST_DELAY > 0:
+        if atual and enviados < IG_POSTS_PER_CYCLE and IG_POST_DELAY > 0:
             time.sleep(IG_POST_DELAY)
     if enviados:
         log(f"📸 Instagram: {enviados} post(s) publicado(s) neste ciclo.")
@@ -4327,7 +4497,7 @@ def _proximo_ciclo(ultimo, intervalo, ativo, agora):
 
 
 def panel_status():
-    fila = load_json(BASE_DIR / "ig_queue.json", [])
+    fila = _ig_queue_publica()
     vistos = load_json(SEEN_FILE, [])
     flags = control_snapshot()
     agora = time.time()
@@ -4350,7 +4520,8 @@ def panel_status():
                           if flags.get("channels", True) and SOURCE_CHANNELS
                           else None),
         "seen": len(vistos) if isinstance(vistos, list) else 0,
-        "ig_queue": len(fila) if isinstance(fila, list) else 0,
+        "ig_queue": len(fila),
+        "ig_queue_items": fila,
         "vitrine": _vitrine_publica(),
         "logs": list(LOG_BUFFER)[-60:],
     }
@@ -4367,6 +4538,9 @@ def panel_execute(kind, payload):
     if kind in ("delete_vitrine", "vitrine_delete"):
         ok, msg = delete_from_vitrine(payload.get("id"),
                                       bool(payload.get("remove_from_seen")))
+        return ("ok: " if ok else "erro: ") + msg
+    if kind in ("delete_ig_queue", "ig_queue_delete"):
+        ok, msg = delete_from_ig_queue(payload.get("qid"))
         return ("ok: " if ok else "erro: ") + msg
     if kind == "set_flags":
         apply_control_flags(payload.get("flags") or payload)

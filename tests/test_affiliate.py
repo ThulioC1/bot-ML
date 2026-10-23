@@ -531,6 +531,7 @@ class InstagramFilterTests(unittest.TestCase):
         self.assertTrue(queued)
         item = save.call_args[0][1][-1]
         self.assertEqual(item["link"], "https://meli.la/abc")
+        self.assertTrue(item["qid"].startswith("q_"))
 
 
 class InstagramHashtagTests(unittest.TestCase):
@@ -556,16 +557,25 @@ class InstagramCycleTests(unittest.TestCase):
 
     def test_posts_two_per_cycle(self):
         queue = [self._queue_item(t) for t in ("a", "b", "c")]
+
+        def fake_load(path, default=None):
+            return queue if str(path).endswith("ig_queue.json") else default
+
+        def fake_save(path, data):
+            if str(path).endswith("ig_queue.json"):
+                queue[:] = data
+
         with mock.patch.object(bot, "IG_POSTS_PER_CYCLE", 2), \
                 mock.patch.object(bot, "IG_POST_DELAY", 0), \
-                mock.patch.object(bot, "load_json", return_value=queue), \
-                mock.patch.object(bot, "save_json") as save, \
+                mock.patch.object(bot, "load_json", side_effect=fake_load), \
+                mock.patch.object(bot, "save_json", side_effect=fake_save) as save, \
                 mock.patch.object(bot, "arte_para_publicar",
                                   return_value="https://img/arte.jpg"), \
                 mock.patch.object(bot, "post_to_instagram",
                                   return_value=True) as post:
             bot.instagram_cycle()
         self.assertEqual(post.call_count, 2)
+        self.assertEqual([item["title"] for item in queue], ["c"])
         self.assertEqual(len(save.call_args_list[-1][0][1]), 1)
 
     def test_failure_keeps_item_and_stops(self):
@@ -619,6 +629,100 @@ class InstagramCycleTests(unittest.TestCase):
         self.assertTrue(url.endswith("/media-1/comments"))
         self.assertEqual(post.call_args_list[2][1]["data"]["message"],
                          "https://meli.la/abc")
+
+
+class InstagramLegacyLinkTests(unittest.TestCase):
+    def test_uses_item_link_without_reading_vitrine(self):
+        item = {"title": "Fone", "price": 80.0, "link": "https://meli.la/new"}
+        with mock.patch.object(bot, "load_json") as load:
+            self.assertEqual(bot._ig_queue_link(item), "https://meli.la/new")
+        load.assert_not_called()
+
+    def test_recovers_link_by_image_from_vitrine(self):
+        item = {"title": "Fone", "price": 80.0, "image": "https://img/1.jpg"}
+        vitrine = [{"id": "x", "title": "Outro título", "price": 80.0,
+                    "image": "https://img/1.jpg", "link": "https://meli.la/old"}]
+        with mock.patch.object(bot, "load_json", return_value=vitrine):
+            self.assertEqual(bot._ig_queue_link(item), "https://meli.la/old")
+
+    def test_recovers_link_by_title_and_price(self):
+        item = {"title": "Fone Bluetooth", "price": 80.0}
+        vitrine = [{"id": "x", "title": "fone bluetooth", "price": 80.0,
+                    "image": "", "link": "https://meli.la/titulo"}]
+        with mock.patch.object(bot, "load_json", return_value=vitrine):
+            self.assertEqual(bot._ig_queue_link(item), "https://meli.la/titulo")
+
+    def test_without_match_returns_empty(self):
+        item = {"title": "Fone", "price": 80.0}
+        with mock.patch.object(bot, "load_json", return_value=[]):
+            self.assertEqual(bot._ig_queue_link(item), "")
+
+
+class InstagramQueueTests(unittest.TestCase):
+    def test_fila_publica_tem_qid_e_ignora_lixo(self):
+        fila = [{"title": "a", "price": 10.0, "image": "i"}, "lixo",
+                {"qid": "q_x", "title": "b"}]
+        with mock.patch.object(bot, "load_json", return_value=fila):
+            pub = bot._ig_queue_publica()
+        self.assertEqual([p["title"] for p in pub], ["a", "b"])
+        self.assertTrue(pub[0]["qid"].startswith("q_"))
+        self.assertEqual(pub[1]["qid"], "q_x")
+
+    def test_remove_item_legado_pela_qid(self):
+        item = {"id": "1", "title": "a", "image": "i", "price": 10.0}
+        qid = bot._ig_queue_qid(item)
+        fila = [item, {"qid": "q_b", "title": "b"}]
+
+        def fake_load(path, default=None):
+            return fila if str(path).endswith("ig_queue.json") else default
+
+        def fake_save(path, data):
+            if str(path).endswith("ig_queue.json"):
+                fila[:] = data
+
+        with mock.patch.object(bot, "load_json", side_effect=fake_load), \
+                mock.patch.object(bot, "save_json", side_effect=fake_save):
+            ok, msg = bot.delete_from_ig_queue(qid)
+        self.assertTrue(ok)
+        self.assertIn("1", msg)
+        self.assertEqual([i["title"] for i in fila], ["b"])
+
+    def test_remove_item_inexistente_nao_salva(self):
+        with mock.patch.object(bot, "load_json",
+                               return_value=[{"qid": "q_a"}]), \
+                mock.patch.object(bot, "save_json") as save:
+            ok, msg = bot.delete_from_ig_queue("q_x")
+        self.assertFalse(ok)
+        self.assertIn("não encontrado", msg)
+        save.assert_not_called()
+
+
+class InstagramDiagnosticTests(unittest.TestCase):
+    def _call(self, comments):
+        respostas = [mock.Mock(), mock.Mock(), mock.Mock()]
+        respostas[0].json.return_value = {"id": "1", "username": "vagantepromo"}
+        respostas[1].json.return_value = {
+            "data": [{"id": "media-1", "timestamp": "2026-10-23T14:57:07+0000"}]
+        }
+        respostas[2].json.return_value = comments
+        with mock.patch.object(bot, "IG_ACCESS_TOKEN", "token"), \
+                mock.patch.object(bot.requests, "get",
+                                  side_effect=respostas):
+            return bot.instagram_diagnostico()
+
+    def test_permission_ok(self):
+        texto = self._call({"data": []})
+        self.assertIn("Token válido: @vagantepromo", texto)
+        self.assertIn("Autorização de comentários OK", texto)
+
+    def test_permission_error_explains_scope(self):
+        texto = self._call({"error": {"code": 200, "message": "Permissions error"}})
+        self.assertIn("código 200", texto)
+        self.assertIn("instagram_business_manage_comments", texto)
+
+    def test_without_token(self):
+        with mock.patch.object(bot, "IG_ACCESS_TOKEN", ""):
+            self.assertIn("IG_ACCESS_TOKEN ausente", bot.instagram_diagnostico())
 
 
 def _coupon_json(cid="1", status="ACTIVE", **extra):
@@ -815,6 +919,13 @@ class PanelExecuteTests(unittest.TestCase):
         self.assertIn("ok:", result)
         dele.assert_called_once_with("x", True)
 
+    def test_delete_fila_ig_delega_para_a_fila(self):
+        with mock.patch.object(bot, "delete_from_ig_queue",
+                               return_value=(True, "removido; 2 itens")) as dele:
+            result = bot.panel_execute("delete_ig_queue", {"qid": "q_x"})
+        self.assertIn("ok:", result)
+        dele.assert_called_once_with("q_x")
+
     def test_comando_desconhecido_estoura(self):
         with self.assertRaises(ValueError):
             bot.panel_execute("explodir", {})
@@ -918,10 +1029,26 @@ class PanelStatusTests(unittest.TestCase):
         for campo in ("updated_at", "online", "flags", "last_telegram",
                       "last_instagram", "last_listener", "next_telegram",
                       "next_instagram", "next_channels", "seen", "ig_queue",
-                      "vitrine", "logs"):
+                      "ig_queue_items", "vitrine", "logs"):
             self.assertIn(campo, dados)
         self.assertEqual(dados["vitrine"], [])
+        self.assertEqual(dados["ig_queue_items"], [])
         self.assertIn("instagram", dados["flags"])
+
+    def test_painel_lista_a_fila_do_instagram(self):
+        fila = [{"qid": "q_a", "title": "Fone", "price": 80.0,
+                 "image": "https://img/1.jpg"}]
+
+        def fake_load(path, default=None):
+            if str(path).endswith("ig_queue.json"):
+                return fila
+            return default
+
+        with mock.patch.object(bot, "load_json", side_effect=fake_load):
+            dados = bot.panel_status()
+        self.assertEqual(dados["ig_queue"], 1)
+        self.assertEqual(dados["ig_queue_items"][0]["qid"], "q_a")
+        self.assertEqual(dados["ig_queue_items"][0]["title"], "Fone")
 
     def test_proximos_ciclos(self):
         agora = 1_700_000_000.0

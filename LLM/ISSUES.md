@@ -5,31 +5,39 @@
 
 ---
 
-## [ABERTA · 2026-10-23] Instagram: link no 1º comentário ainda não rodou AO VIVO
+## [PARCIAL · 2026-10-23] Instagram: link no 1º comentário ainda não apareceu AO VIVO
 
 O post do IG agora chama `POST /v18.0/{media_id}/comments` com o link de
-afiliado. Só foi testado com mock (95 testes). No Instagram real falta
-confirmar:
+afiliado. Checagem ao vivo em 23/10: `GET /me`, `/me/media` e
+`GET /{media_id}/comments` responderam **200** para @vagantepromo — a
+permissão `instagram_business_manage_comments` está OK. `/me/permissions` não
+existe nesse tipo de token (erro 100) e `debug_token` exige app token (erro
+10); para ver escopos, use o App Dashboard da Meta ou o Access Token Debugger.
+O comando `/igcheck` (dono) faz essa checagem a qualquer momento.
 
-- se o token de `IG_ACCESS_TOKEN` tem a permissão de **gerenciar comentários**
-  (sem ela, a API devolve erro e o bot apenas registra o aviso, mantendo o
-  post);
-- se o comentário aparece no post e se o texto "Link no primeiro comentário"
-  está coerente;
-- que itens antigos de `ig_queue.json` (sem o campo `link`) continuam saindo
-  com "Link na bio", sem comentário.
+**Causa dos posts sem comentário:** os posts de 14:56/14:57 UTC foram itens
+que já estavam em `ig_queue.json` antes da mudança; a fila antiga não gravava
+`link`, então a legenda caiu em "Link na bio". `_ig_queue_link()` agora tenta
+recuperar o link pela vitrine (id, imagem ou título+preço) e a fila nova grava
+`id`/`link`.
+
+**Ainda falta validar:** o primeiro **comentário escrito** em um post novo (ou
+antigo recuperado) e o texto "Link no primeiro comentário" na legenda.
 
 > O link em comentário/legenda **não é clicável**; o link clicável continua
 > sendo o da bio.
 
-**Como validar:** publicar uma oferta no IG, abrir o post e conferir o
-comentário; se falhar, ver a linha `⚠️ Instagram comentário:` no painel/log.
+**Como validar:** rodar `/igcheck`; publicar uma oferta nova no IG e conferir
+o comentário. Se falhar, ver a linha `⚠️ Instagram comentário:` no log.
 
 ## [ABERTA · 2026-10-23] Painel novo ainda não foi publicado na Vercel
 
 `panel/index.html` e `panel/app.js` foram redesenhados e conferidos apenas em
 preview local (Chrome headless). Falta subir para a Vercel e testar com o
-Firebase real, em desktop e celular.
+Firebase real, em desktop e celular. O novo cartão "Fila do Instagram" e a
+exclusão por `delete_ig_queue` também só foram validados em testes offline;
+confirmar com Firebase real que o item some da fila em até 10 s, não é
+publicado e continua na vitrine.
 
 ## [ABERTA · 2026-10-19] Cupons do ML: link da listagem e post real no grupo
 

@@ -224,6 +224,85 @@ function renderVitrine(itens) {
   });
 }
 
+function renderFilaIg(itens) {
+  const box = $("filaIg");
+  const contador = $("qCount");
+  box.textContent = "";
+  contador.textContent = itens.length
+    ? itens.length + (itens.length === 1 ? " item na fila" : " itens na fila")
+    : "fila vazia";
+  if (!itens.length) {
+    box.innerHTML = '<div class="muted">Nenhum post aguardando.</div>';
+    return;
+  }
+  itens.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "item";
+    if (item.image) {
+      const img = document.createElement("img");
+      img.src = item.image;
+      img.alt = "";
+      img.loading = "lazy";
+      row.appendChild(img);
+    }
+    const info = document.createElement("div");
+    info.className = "info";
+    const titulo = document.createElement("b");
+    titulo.textContent = item.title || "(sem título)";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    if (typeof item.price === "number") {
+      const preco = document.createElement("span");
+      preco.className = "price";
+      preco.textContent = item.price.toLocaleString("pt-BR", {
+        style: "currency", currency: "BRL"
+      });
+      meta.appendChild(preco);
+    }
+    const detalhe = document.createElement("span");
+    detalhe.className = "muted";
+    detalhe.textContent = item.id || "sem id";
+    meta.appendChild(detalhe);
+    if (item.link && /^https?:\/\//i.test(item.link)) {
+      const abrir = document.createElement("a");
+      abrir.className = "open";
+      abrir.textContent = "Abrir";
+      abrir.href = item.link;
+      abrir.target = "_blank";
+      abrir.rel = "noopener noreferrer";
+      meta.appendChild(abrir);
+    }
+    info.appendChild(titulo);
+    info.appendChild(meta);
+    row.appendChild(info);
+    const btn = document.createElement("button");
+    btn.className = "danger";
+    btn.textContent = "Excluir";
+    btn.title = "Remove só da fila do Instagram; a vitrine não muda.";
+    btn.addEventListener("click", () => removerFila(item, btn));
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+
+async function removerFila(item, btn) {
+  if (!window.confirm(`Excluir "${item.title || item.qid}" da fila do Instagram?`)) return;
+  btn.disabled = true;
+  try {
+    await F.addDoc(F.collection(db, "panel_commands"), {
+      type: "delete_ig_queue",
+      payload: { qid: item.qid },
+      status: "pending",
+      requested_at: F.serverTimestamp(),
+      requested_by: auth.currentUser ? auth.currentUser.email : ""
+    });
+    toast("Exclusão solicitada. O bot confirma em segundos.");
+  } catch (e) {
+    toast("Falha: " + e.message);
+    btn.disabled = false;
+  }
+}
+
 async function removerItem(item, btn) {
   if (!window.confirm(`Remover "${item.title || item.id}" da vitrine?`)) return;
   const repostar = $("repostar").checked;
@@ -296,8 +375,9 @@ function montarStatus() {
     dot.className = "dot " + (online ? "on" : "off");
     kOnline.appendChild(dot);
     kOnline.appendChild(document.createTextNode(online ? " online" : " offline"));
+    const fila = Array.isArray(d.ig_queue_items) ? d.ig_queue_items : [];
     $("kSeen").textContent = d.seen ?? "—";
-    $("kQueue").textContent = d.ig_queue ?? "—";
+    $("kQueue").textContent = d.ig_queue ?? fila.length;
     $("kVitrine").textContent = (d.vitrine || []).length;
     $("tTelegram").textContent = fmtHora(d.last_telegram);
     $("tInstagram").textContent = fmtHora(d.last_instagram);
@@ -309,6 +389,7 @@ function montarStatus() {
     definirProximo("channels", d.next_channels, flags.channels !== false);
     tickContagens();
     renderLogs(d.logs || []);
+    renderFilaIg(fila);
     renderVitrine(d.vitrine || []);
   }, (e) => toast("Status: " + e.message));
 

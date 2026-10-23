@@ -5,6 +5,45 @@
 
 ---
 
+## [2026-10-23 13:50] — Sessão 28: fila do Instagram visível e removível no painel
+
+**Objetivo:** mostrar no painel os próximos posts da fila do Instagram, como a
+vitrine, e permitir excluir itens dela antes de serem publicados.
+
+**Arquivos alterados:**
+- `bot.py` — `IG_QUEUE_FILE`/`IG_QUEUE_LOCK`; `_ig_queue_qid()` (qid estável,
+  inclusive para itens legados sem qid), `_ig_queue_publica()` e
+  `delete_from_ig_queue()`; `schedule_instagram()` grava `qid`; a fila agora é
+  lida/gravada sob lock; `panel_status()` publica `ig_queue_items`;
+  `panel_execute()` aceita `delete_ig_queue` (payload `qid`).
+- `bot.py` — `instagram_cycle()` relê a fila a cada post e remove o item pelo
+  `qid` depois de publicar, então uma exclusão feita no painel entre dois posts
+  não é ignorada/sobrescrita (e itens excluídos não são postados).
+- `panel/index.html` — novo cartão "Fila do Instagram" ao lado da vitrine;
+  logs agora ocupam a linha inteira; `.col-12` e responsividade.
+- `panel/app.js` — `renderFilaIg()`/`removerFila()`: lista imagem, título,
+  preço, id/link e botão "Excluir"; exclusão só da fila, sem mexer na vitrine.
+- `tests/test_affiliate.py` — +5 testes (qid/legado, remoção, item inexistente,
+  comando do painel e `ig_queue_items` no status). Total 107.
+
+**Análise / o que foi observado:**
+- O painel já recebia apenas a contagem `ig_queue`; agora recebe até 10 itens
+  enxutos (`ig_queue_items`), no mesmo padrão da vitrine.
+- A exclusão é feita pelo bot (comando no Firestore), como na vitrine: o painel
+  não escreve direto no arquivo local. Demora até `PANEL_POLL_SECONDS` (10 s).
+- Itens antigos não têm `qid`; o bot deriva um id estável de id/título/imagem/
+  preço, então eles também podem ser excluídos.
+- Excluir da fila **não** remove da vitrine nem libera o produto para ser
+  recolhido de novo; ele continua na bio.
+- `instagram_cycle()` passou a reler a fila antes de cada post para respeitar
+  exclusões feitas durante a pausa entre publicações.
+
+**Resultado:**
+- ✅ 107 testes passando; `py_compile` e `node --check panel/app.js` OK.
+- ⚠️ Falta publicar o painel na Vercel e testar a exclusão com Firebase real.
+
+---
+
 ## [2026-10-23 08:30] — Sessão 27: hashtags no IG, link no 1º comentário e painel redesenhado
 
 **Objetivo:** aumentar o alcance dos posts do Instagram, publicar o link da
@@ -17,28 +56,41 @@ oferta no primeiro comentário e deixar o painel remoto mais organizado/bonito.
   o comentário depois do media; `schedule_instagram(..., link=)` e
   `instagram_cycle()` levam o link de afiliado até a fila e montam a legenda
   com 3 hashtags sorteadas; `publish()` repassa o link para a fila.
+- `bot.py` (rodada 2) — `_ig_queue_link()` recupera o link de itens antigos da
+  fila pela vitrine (id, imagem ou título+preço); a fila passa a guardar `id`;
+  `instagram_diagnostico()` e o comando `/igcheck` (dono) conferem o token e a
+  permissão de comentários sem postar nada.
 - `panel/index.html` — layout novo em grid de 12 colunas, header em vidro,
   KPIs, cartões, switches, vitrine, logs e tela de login repaginados.
 - `panel/app.js` — dicas nas funções, logs coloridos por nível, preço/link na
   vitrine, toast com animação e texto online/offline em português.
-- `tests/test_affiliate.py` — +6 testes (fila com link, sorteio de hashtags,
-  legenda/comentário, endpoint de comentário, publish → fila). Total 95.
+- `tests/test_affiliate.py` — +13 testes (fila com link, sorteio de hashtags,
+  legenda/comentário, endpoint de comentário, publish → fila, recuperação de
+  link antigo e diagnóstico). Total 102.
 - `.env.example` — `IG_HASHTAG_COUNT=3`.
 
 **Análise / o que foi observado:**
 - O link no primeiro comentário é possível pela Graph API, mas **não fica
   clicável** (assim como na legenda); o link clicável continua sendo o da bio.
-- Exige permissão de comentários no token. Se a chamada falhar, o post **não**
-  é desfeito: o bot só registra o aviso e mantém a publicação.
-- Itens antigos de `ig_queue.json` não têm `link`; nesses a legenda usa
-  "Link na bio" e nenhum comentário é enviado.
+- Exige a permissão `instagram_business_manage_comments` (Instagram Login). Se
+  a chamada falhar, o post **não** é desfeito: o bot só registra o aviso.
+- **Checagem ao vivo (23/10):** `GET /me`, `/me/media` e
+  `GET /{media_id}/comments` responderam 200 para @vagantepromo — a autorização
+  de comentários está OK. `/me/permissions` não existe nesse tipo de token
+  (erro 100) e `debug_token` exige app token (erro 10); para ver os escopos, use
+  o App Dashboard da Meta ou o Access Token Debugger.
+- **Causa do comentário não sair:** os dois posts novos (14:56/14:57 UTC) foram
+  itens que já estavam em `ig_queue.json` antes da mudança; a fila antiga não
+  tinha o campo `link`, então a legenda caiu em "Link na bio". A recuperação
+  pela vitrine corrige os itens antigos; ofertas novas já entram com link.
 - O painel anterior ficava estreito no desktop, com muito espaço vazio e
   valores quebrando linha. O preview foi conferido no Chrome headless em
-  1440×1100 (sem Firebase real).
+  1440×1100 e 500×900 (sem Firebase real).
 
 **Resultado:**
-- ✅ 95 testes passando; `py_compile` e `node --check panel/app.js` OK.
-- ⚠️ Falta validar o comentário no Instagram real (permissão do token) e
+- ✅ 102 testes passando; `py_compile` e `node --check panel/app.js` OK.
+- ✅ Autorização de comentários verificada AO VIVO (leitura de comentários).
+- ⚠️ Falta ver o primeiro comentário real em um post novo/antigo recuperado e
   publicar o painel novo na Vercel.
 
 ---

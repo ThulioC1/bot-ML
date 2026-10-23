@@ -81,6 +81,7 @@
   .col-4 { grid-column: span 4; }
   .col-5 { grid-column: span 5; }
   .col-7 { grid-column: span 7; }
+  .col-12 { grid-column: span 12; }
   .card-head {
     display: flex; align-items: center; justify-content: space-between;
     gap: 12px; margin-bottom: 14px;
@@ -298,13 +299,13 @@
   @media (max-width: 1180px) {
     main { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .col-4, .col-5, .col-7 { grid-column: span 1; }
-    .logs-card { grid-column: span 2; }
+    .col-12, .logs-card { grid-column: span 2; }
   }
   @media (max-width: 760px) {
     header { padding: 12px 16px; }
     .brand p, .userbox .muted { display: none; }
     main { grid-template-columns: minmax(0, 1fr); padding: 18px 14px 40px; }
-    .col-4, .col-5, .col-7, .logs-card { grid-column: auto; }
+    .col-4, .col-5, .col-7, .col-12, .logs-card { grid-column: auto; }
     .toolbar { grid-template-columns: 1fr; }
   }
 </style>
@@ -391,7 +392,15 @@
       <div class="items" id="vitrine"></div>
     </section>
 
-    <section class="card col-5 logs-card">
+    <section class="card col-5">
+      <div class="card-head">
+        <h2>Fila do Instagram</h2>
+        <span class="muted" id="qCount">próximos posts</span>
+      </div>
+      <div class="items" id="filaIg"></div>
+    </section>
+
+    <section class="card col-12 logs-card">
       <div class="card-head">
         <h2>Logs</h2>
         <span class="muted">últimas linhas</span>

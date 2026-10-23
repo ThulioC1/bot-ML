@@ -1,6 +1,20 @@
 # Estado do Projeto
 
-> Última atualização: **2026-10-23 (sessão 27 — alcance do Instagram + painel novo)**
+> Última atualização: **2026-10-23 (sessão 28 — fila do Instagram no painel)**
+
+## 🆕 Sessão 28 — Fila do Instagram no painel (23/10)
+
+O painel agora lista os próximos posts do Instagram (`ig_queue_items`, até 10)
+no mesmo estilo da vitrine. Cada item mostra imagem, título, preço, id/link e
+tem o botão "Excluir", que envia `delete_ig_queue` com o `qid` para o bot. A
+exclusão remove só da fila; o item continua na vitrine e não é republicado.
+Itens antigos sem `qid` ganham um id estável derivado de id/título/imagem/preço.
+A fila é lida/gravada com `IG_QUEUE_LOCK` e `instagram_cycle()` relê antes de
+cada post, então um item excluído durante a pausa não é publicado. O status
+continua mandando a contagem em `ig_queue`, para compatibilidade.
+
+**Estado:** 107 testes. Falta publicar o painel na Vercel e validar a exclusão
+com Firebase real.
 
 ## 🆕 Sessão 27 — Hashtags, link no 1º comentário e painel novo (23/10)
 
@@ -12,16 +26,22 @@
 O link de afiliado vai para o **primeiro comentário** via
 `POST /v18.0/{media_id}/comments`; a legenda avisa "Link no primeiro
 comentário". Se o token não tiver permissão de comentar, o post continua no ar
-e só registra aviso — o link na bio segue como plano B. Itens antigos da fila
-(sem `link`) usam "Link na bio" e não recebem comentário.
+e só registra aviso — o link na bio segue como plano B. A fila antiga não tinha
+`link`; `_ig_queue_link()` procura o item na vitrine (id, imagem ou
+título+preço) para não perder o comentário desses posts. O comando `/igcheck`
+(dono) mostra conta, último post e se a permissão de comentários está OK.
+Checagem ao vivo em 23/10: `GET /me`, `/me/media` e `GET comments` = 200; a
+autorização está OK. `/me/permissions` não existe nesse token e `debug_token`
+exige app token — para escopos, usar o App Dashboard ou o Access Token Debugger.
 
 **Painel:** `panel/index.html` e `panel/app.js` foram redesenhados (grid de 12
 colunas, KPIs, dicas nas funções, logs coloridos, preço/link na vitrine, login
 e header novos). O layout antigo ficava estreito e com valores quebrando linha.
 Validado só em preview headless; falta publicar na Vercel.
 
-**Estado:** 95 testes. `post_to_instagram()` mudou de assinatura apenas de
-forma retrocompatível (`comment=None`); `schedule_instagram()` ganhou `link=""`.
+**Estado na sessão 27:** 102 testes. `post_to_instagram()` mudou de assinatura
+apenas de forma retrocompatível (`comment=None`); `schedule_instagram()` ganhou
+`link=""` e grava também `id` na fila.
 
 ## 🗒️ Sessões 26.10–26.12 — commits de 21–22/10 (documentados depois)
 
@@ -36,7 +56,7 @@ Estavam no git mas não no changelog da época:
 - `1dfa49c`, `a80aa07`, `7580c2e`, `0ba23d7`, `e9e1ecf`, `900bb0c`,
   `86bb730` — correções de Firebase/painel/login e regra do Firestore.
 
-O `bot.py` atual tem **~4.450 linhas** e **95 testes** — os números antigos
+O `bot.py` atual tem **~4.650 linhas** e **107 testes** — os números antigos
 deste documento (1.290 linhas/81 testes) estão desatualizados.
 
 ## 🆕 Sessão 26.9 — Painel de controle remoto (21/10)
