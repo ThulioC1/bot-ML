@@ -4420,7 +4420,7 @@ def instagram_cycle():
         bloco = price_block(item.get("price"), item.get("old"))
         if bloco:
             linhas += [bloco, ""]
-        linhas.append("🔗 Link no primeiro comentário!" if link else "🔗 Link na bio!")
+        linhas.append("🔗 Link no primeiro comentário ou na BIO!" if link else "🔗 Link na bio!")
         linhas += ["", ig_hashtags()]
         caption = "\n".join(linhas)
         public_url = arte_para_publicar(item.get("image"), item.get("price"), item.get("old"), pct, item.get("title"))
