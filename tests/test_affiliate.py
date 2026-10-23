@@ -407,6 +407,18 @@ class PublishTests(unittest.TestCase):
         vitrine.assert_called_once()
         self.assertEqual(vitrine.call_args[0][0]["link"], "https://meli.la/ok")
 
+    def test_publish_sends_link_to_instagram_queue(self):
+        product = self._product("pv_test_ig")
+        product["affiliate_link"] = "https://meli.la/ig"
+        with mock.patch.object(bot, "schedule_instagram",
+                               return_value=True) as sched, \
+                mock.patch.object(bot, "send_message", return_value=True), \
+                mock.patch.object(bot, "save_to_vitrine"), \
+                mock.patch.object(bot, "load_json", return_value={}), \
+                mock.patch.object(bot, "save_json"):
+            bot.publish(product, announce_instagram=True)
+        self.assertEqual(sched.call_args.kwargs.get("link"), "https://meli.la/ig")
+
     def test_publish_prefers_affiliate_link(self):
         product = self._product("pv_test_3")
         product["affiliate_link"] = "https://shope.ee/ja"
@@ -509,11 +521,38 @@ class InstagramFilterTests(unittest.TestCase):
         self.assertTrue(queued)
         save.assert_called_once()
 
+    def test_queue_stores_affiliate_link_for_first_comment(self):
+        with mock.patch.object(bot, "IG_MIN_DISCOUNT", 0), \
+                mock.patch.object(bot, "load_json", return_value=[]), \
+                mock.patch.object(bot, "save_json") as save:
+            queued = bot.schedule_instagram(
+                {"thumbnail": "https://img/1.jpg"}, "Fone", 80.0, 100.0,
+                link="https://meli.la/abc")
+        self.assertTrue(queued)
+        item = save.call_args[0][1][-1]
+        self.assertEqual(item["link"], "https://meli.la/abc")
+
+
+class InstagramHashtagTests(unittest.TestCase):
+    def test_hashtags_are_three_distinct_from_the_list(self):
+        for _ in range(20):
+            tags = bot.ig_hashtags().split()
+            self.assertEqual(len(tags), 3)
+            self.assertEqual(len(set(tags)), 3)
+            self.assertTrue(set(tags).issubset(set(bot.IG_HASHTAGS)))
+
+    def test_hashtag_count_env_never_exceeds_list(self):
+        self.assertLessEqual(bot.IG_HASHTAG_COUNT, len(bot.IG_HASHTAGS))
+        self.assertGreaterEqual(bot.IG_HASHTAG_COUNT, 1)
+
 
 class InstagramCycleTests(unittest.TestCase):
-    def _queue_item(self, title):
-        return {"title": title, "price": 80.0, "old": 100.0,
+    def _queue_item(self, title, link=None):
+        item = {"title": title, "price": 80.0, "old": 100.0,
                 "image": "https://img/1.jpg", "pct": 20.0}
+        if link:
+            item["link"] = link
+        return item
 
     def test_posts_two_per_cycle(self):
         queue = [self._queue_item(t) for t in ("a", "b", "c")]
@@ -542,6 +581,44 @@ class InstagramCycleTests(unittest.TestCase):
             bot.instagram_cycle()
         self.assertEqual(post.call_count, 1)
         save.assert_not_called()
+
+    def test_caption_has_three_hashtags_and_link_goes_to_first_comment(self):
+        link = "https://meli.la/abc"
+        queue = [self._queue_item("a", link=link)]
+        tags = ["#achados", "#ofertas", "#promocao"]
+        with mock.patch.object(bot, "IG_POSTS_PER_CYCLE", 1), \
+                mock.patch.object(bot, "IG_POST_DELAY", 0), \
+                mock.patch.object(bot, "load_json", return_value=queue), \
+                mock.patch.object(bot, "save_json"), \
+                mock.patch.object(bot, "arte_para_publicar",
+                                  return_value="https://img/arte.jpg"), \
+                mock.patch.object(bot.random, "sample", return_value=tags), \
+                mock.patch.object(bot, "post_to_instagram",
+                                  return_value=True) as post:
+            bot.instagram_cycle()
+        caption = post.call_args[0][1]
+        self.assertEqual(post.call_args.kwargs.get("comment"), link)
+        self.assertIn("Link no primeiro comentário", caption)
+        for tag in tags:
+            self.assertIn(tag, caption)
+
+    def test_post_publishes_comment_with_media_id(self):
+        respostas = [mock.Mock(), mock.Mock(), mock.Mock()]
+        respostas[0].json.return_value = {"id": "container-1"}
+        respostas[1].json.return_value = {"id": "media-1"}
+        respostas[2].json.return_value = {"id": "comment-1"}
+        with mock.patch.object(bot, "IG_ACCESS_TOKEN", "token"), \
+                mock.patch.object(bot, "IG_USER_ID", "user-1"), \
+                mock.patch.object(bot.requests, "post",
+                                  side_effect=respostas) as post, \
+                mock.patch.object(bot.time, "sleep"):
+            ok = bot.post_to_instagram("https://img/arte.jpg", "legenda",
+                                       comment="https://meli.la/abc")
+        self.assertTrue(ok)
+        url = post.call_args_list[2][0][0]
+        self.assertTrue(url.endswith("/media-1/comments"))
+        self.assertEqual(post.call_args_list[2][1]["data"]["message"],
+                         "https://meli.la/abc")
 
 
 def _coupon_json(cid="1", status="ACTIVE", **extra):

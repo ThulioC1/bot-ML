@@ -236,6 +236,16 @@ IG_MIN_DISCOUNT = _num_env("IG_MIN_DISCOUNT", 0)
 IG_POSTS_PER_CYCLE = max(1, int(_num_env("IG_POSTS_PER_CYCLE", 2)))
 IG_POST_DELAY = _num_env("IG_POST_DELAY", 30)
 
+# Hashtags sorteadas em cada legenda. O sorteio evita repetir sempre as mesmas
+# tres tags e ajuda o alcance sem transformar a legenda numa parede de texto.
+IG_HASHTAGS = (
+    "#achados", "#ofertas", "#promocao", "#comprasonline", "#acheinashopee",
+    "#achadinhosshopee", "#shopeebrasil", "#amazonfinds", "#mercadolivre",
+    "#dicadeeconomia", "#comatlantico", "#achadinhos",
+)
+IG_HASHTAG_COUNT = max(1, min(int(_num_env("IG_HASHTAG_COUNT", 3)),
+                              len(IG_HASHTAGS)))
+
 # Cupons do Mercado Livre: quantos posts novos por ciclo e pausa entre eles.
 CUPOM_POSTS_PER_CYCLE = max(1, int(_num_env("CUPOM_POSTS_PER_CYCLE", 3)))
 CUPOM_DELAY = _num_env("CUPOM_DELAY", 5)
@@ -1488,7 +1498,31 @@ def resolve_ig_user_id():
     return True
 
 
-def post_to_instagram(image_url, caption):
+def ig_hashtags():
+    """Sorteia as hashtags da legenda (sem repetir)."""
+    return " ".join(random.sample(IG_HASHTAGS, IG_HASHTAG_COUNT))
+
+
+def post_instagram_comment(media_id, message):
+    """Publica o primeiro comentário do post (usado para o link da oferta)."""
+    if not IG_ACCESS_TOKEN or not media_id or not message:
+        return False
+    try:
+        resp = requests.post(
+            f"https://graph.instagram.com/v18.0/{media_id}/comments",
+            data={"message": message, "access_token": IG_ACCESS_TOKEN},
+            timeout=30,
+        ).json()
+        if "id" in resp:
+            log(f"💬 Instagram: link no primeiro comentário ({resp['id']}).")
+            return True
+        log(f"⚠️ Instagram comentário: {str(resp)[:220]}")
+    except Exception as exc:
+        log(f"⚠️ Instagram comentário: {type(exc).__name__}: {exc}")
+    return False
+
+
+def post_to_instagram(image_url, caption, comment=None):
     if not IG_ACCESS_TOKEN or not IG_USER_ID or not image_url:
         log("⏭️ Instagram ignorado: sem token, id ou imagem pública.")
         return False
@@ -1510,6 +1544,8 @@ def post_to_instagram(image_url, caption):
         ).json()
         if "id" in published:
             log(f"✅ Instagram publicado: {published['id']}")
+            if comment:
+                post_instagram_comment(published["id"], comment)
             return True
         log(f"❌ Instagram publish: {str(published)[:220]}")
     except Exception as exc:
@@ -3323,11 +3359,12 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
         })
 
     if announce_instagram:
-        product["ig_queued"] = schedule_instagram(product, title, price, old)
+        product["ig_queued"] = schedule_instagram(product, title, price, old,
+                                                  link=link)
     return ok
 
 
-def schedule_instagram(product, title, price, old):
+def schedule_instagram(product, title, price, old, link=""):
     """Enfileira o post do Instagram. Devolve True se entrou na fila."""
     if not control_enabled("instagram"):
         log("⏸️ Instagram desligado no painel; arte não enfileirada.")
@@ -3346,7 +3383,8 @@ def schedule_instagram(product, title, price, old):
         log("⏭️ Instagram: produto sem imagem.")
         return False
     queue = load_json(BASE_DIR / "ig_queue.json", [])
-    queue.append({"title": title, "price": price, "old": old, "image": image, "pct": pct})
+    queue.append({"title": title, "price": price, "old": old, "image": image,
+                  "pct": pct, "link": link or ""})
     save_json(BASE_DIR / "ig_queue.json", queue[-10:])
     log(f"🖼️ Arte do post '{title[:32]}' entrou na fila do Instagram.")
     return True
@@ -4212,9 +4250,16 @@ def instagram_cycle():
     while queue and enviados < IG_POSTS_PER_CYCLE:
         item = queue[0]
         pct = item.get("pct")
-        caption = f"🔥 {item['title']}\n\n{price_block(item.get('price'), item.get('old'))}\n\n🔗 Link na bio!"
+        link = item.get("link") or ""
+        linhas = [f"🔥 {item['title']}", ""]
+        bloco = price_block(item.get("price"), item.get("old"))
+        if bloco:
+            linhas += [bloco, ""]
+        linhas.append("🔗 Link no primeiro comentário!" if link else "🔗 Link na bio!")
+        linhas += ["", ig_hashtags()]
+        caption = "\n".join(linhas)
         public_url = arte_para_publicar(item.get("image"), item.get("price"), item.get("old"), pct, item.get("title"))
-        if not post_to_instagram(public_url, caption):
+        if not post_to_instagram(public_url, caption, comment=link or None):
             log("⏭️ Post do Instagram não concluído; item mantido na fila.")
             break
         queue = queue[1:]

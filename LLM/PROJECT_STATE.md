@@ -1,6 +1,43 @@
 # Estado do Projeto
 
-> Última atualização: **2026-10-21 (sessão 26.9 — painel de controle remoto)**
+> Última atualização: **2026-10-23 (sessão 27 — alcance do Instagram + painel novo)**
+
+## 🆕 Sessão 27 — Hashtags, link no 1º comentário e painel novo (23/10)
+
+**Instagram:** cada legenda agora leva 3 hashtags sorteadas de
+`IG_HASHTAGS` (12 tags: #achados, #ofertas, #promocao, #comprasonline,
+#acheinashopee, #achadinhosshopee, #shopeebrasil, #amazonfinds, #mercadolivre,
+#dicadeeconomia, #comatlantico, #achadinhos). O sorteio é por post
+(`IG_HASHTAG_COUNT=3`, configurável no `.env`).
+O link de afiliado vai para o **primeiro comentário** via
+`POST /v18.0/{media_id}/comments`; a legenda avisa "Link no primeiro
+comentário". Se o token não tiver permissão de comentar, o post continua no ar
+e só registra aviso — o link na bio segue como plano B. Itens antigos da fila
+(sem `link`) usam "Link na bio" e não recebem comentário.
+
+**Painel:** `panel/index.html` e `panel/app.js` foram redesenhados (grid de 12
+colunas, KPIs, dicas nas funções, logs coloridos, preço/link na vitrine, login
+e header novos). O layout antigo ficava estreito e com valores quebrando linha.
+Validado só em preview headless; falta publicar na Vercel.
+
+**Estado:** 95 testes. `post_to_instagram()` mudou de assinatura apenas de
+forma retrocompatível (`comment=None`); `schedule_instagram()` ganhou `link=""`.
+
+## 🗒️ Sessões 26.10–26.12 — commits de 21–22/10 (documentados depois)
+
+Estavam no git mas não no changelog da época:
+- `90fd10e` — fluxo dos canais parceiros: fila (`channel_queue.json`) e lotes
+  de 3 ofertas a cada 30 min (`CHANNEL_BATCH_SIZE/INTERVAL`), com
+  `channel_publisher_loop` em thread separada.
+- `d9ccb8c` — logs com `_redact()` (não vaza token) e backoff exponencial no
+  `private_listener` (máx. 60 s, aviso a cada 5 min).
+- `af96d69` — cronômetro do próximo ciclo no painel (`next_telegram`,
+  `next_instagram`, `next_channels`, `_channel_schedule` e `_proximo_ciclo`).
+- `1dfa49c`, `a80aa07`, `7580c2e`, `0ba23d7`, `e9e1ecf`, `900bb0c`,
+  `86bb730` — correções de Firebase/painel/login e regra do Firestore.
+
+O `bot.py` atual tem **~4.450 linhas** e **95 testes** — os números antigos
+deste documento (1.290 linhas/81 testes) estão desatualizados.
 
 ## 🆕 Sessão 26.9 — Painel de controle remoto (21/10)
 

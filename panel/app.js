@@ -9,6 +9,15 @@ const LABELS = {
   telegram: "Publicação no Telegram"
 };
 
+const HINTS = {
+  channels: "Repassa as ofertas dos canais parceiros",
+  sheet: "Lê os produtos da planilha do Google",
+  scrape: "Busca ofertas no Mercado Livre e na Shopee",
+  coupons: "Publica os cupons ativos do Mercado Livre",
+  instagram: "Monta a fila e publica no Instagram",
+  telegram: "Publica as ofertas no canal e no grupo"
+};
+
 const SDK_VERSION = "10.12.2";
 const SDK = "https://www.gstatic.com/firebasejs/" + SDK_VERSION + "/";
 
@@ -28,9 +37,9 @@ function msg(texto) {
 function toast(texto) {
   const el = $("toast");
   el.textContent = texto;
-  el.style.display = "block";
+  el.classList.add("show");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.style.display = "none"; }, 2600);
+  toast._t = setTimeout(() => el.classList.remove("show"), 2600);
 }
 
 function fmtHora(ts) {
@@ -112,8 +121,15 @@ function montarFlags() {
   Object.keys(LABELS).forEach((nome) => {
     const row = document.createElement("div");
     row.className = "row";
-    const label = document.createElement("span");
+    const info = document.createElement("div");
+    info.className = "flag-info";
+    const label = document.createElement("b");
     label.textContent = LABELS[nome];
+    const hint = document.createElement("span");
+    hint.className = "flag-hint";
+    hint.textContent = HINTS[nome] || "";
+    info.appendChild(label);
+    info.appendChild(hint);
     const sw = document.createElement("label");
     sw.className = "switch";
     const input = document.createElement("input");
@@ -123,7 +139,7 @@ function montarFlags() {
     const span = document.createElement("span");
     sw.appendChild(input);
     sw.appendChild(span);
-    row.appendChild(label);
+    row.appendChild(info);
     row.appendChild(sw);
     box.appendChild(row);
   });
@@ -173,11 +189,29 @@ function renderVitrine(itens) {
     info.className = "info";
     const titulo = document.createElement("b");
     titulo.textContent = item.title || "(sem título)";
-    const meta = document.createElement("span");
-    const preco = typeof item.price === "number"
-      ? item.price.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })
-      : "sem preço";
-    meta.textContent = `${preco} · ${item.time || ""} · ${item.id}`;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    if (typeof item.price === "number") {
+      const preco = document.createElement("span");
+      preco.className = "price";
+      preco.textContent = item.price.toLocaleString("pt-BR", {
+        style: "currency", currency: "BRL"
+      });
+      meta.appendChild(preco);
+    }
+    const detalhe = document.createElement("span");
+    detalhe.className = "muted";
+    detalhe.textContent = [item.time, item.id].filter(Boolean).join(" · ");
+    meta.appendChild(detalhe);
+    if (item.link && /^https?:\/\//i.test(item.link)) {
+      const abrir = document.createElement("a");
+      abrir.className = "open";
+      abrir.textContent = "Abrir";
+      abrir.href = item.link;
+      abrir.target = "_blank";
+      abrir.rel = "noopener noreferrer";
+      meta.appendChild(abrir);
+    }
     info.appendChild(titulo);
     info.appendChild(meta);
     row.appendChild(info);
@@ -224,6 +258,25 @@ async function enviarComando(tipo) {
   }
 }
 
+function renderLogs(linhas) {
+  const box = $("logs");
+  box.textContent = "";
+  if (!linhas.length) {
+    box.innerHTML = '<span class="muted">Nenhum log recebido ainda.</span>';
+    return;
+  }
+  linhas.forEach((linha) => {
+    const div = document.createElement("div");
+    div.className = "log-line";
+    if (linha.includes("❌")) div.classList.add("err");
+    else if (linha.includes("⚠️")) div.classList.add("warn");
+    else if (linha.includes("✅")) div.classList.add("ok");
+    div.textContent = linha;
+    box.appendChild(div);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
 function montarStatus() {
   F.onSnapshot(F.doc(db, "panel_control", "state"), (snap) => {
     const dados = snap.data() || {};
@@ -242,7 +295,7 @@ function montarStatus() {
     const dot = document.createElement("span");
     dot.className = "dot " + (online ? "on" : "off");
     kOnline.appendChild(dot);
-    kOnline.appendChild(document.createTextNode(online ? " on" : " off"));
+    kOnline.appendChild(document.createTextNode(online ? " online" : " offline"));
     $("kSeen").textContent = d.seen ?? "—";
     $("kQueue").textContent = d.ig_queue ?? "—";
     $("kVitrine").textContent = (d.vitrine || []).length;
@@ -255,7 +308,7 @@ function montarStatus() {
     definirProximo("instagram", d.next_instagram, flags.instagram !== false);
     definirProximo("channels", d.next_channels, flags.channels !== false);
     tickContagens();
-    $("logs").textContent = (d.logs || []).join("\n");
+    renderLogs(d.logs || []);
     renderVitrine(d.vitrine || []);
   }, (e) => toast("Status: " + e.message));
 

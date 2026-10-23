@@ -5,6 +5,44 @@
 
 ---
 
+## [2026-10-23 08:30] — Sessão 27: hashtags no IG, link no 1º comentário e painel redesenhado
+
+**Objetivo:** aumentar o alcance dos posts do Instagram, publicar o link da
+oferta no primeiro comentário e deixar o painel remoto mais organizado/bonito.
+
+**Arquivos alterados:**
+- `bot.py` — `IG_HASHTAGS` (12 tags), `IG_HASHTAG_COUNT` (default 3) e
+  `ig_hashtags()` com `random.sample`; `post_instagram_comment()` via
+  `POST /v18.0/{media_id}/comments`; `post_to_instagram(..., comment=)` publica
+  o comentário depois do media; `schedule_instagram(..., link=)` e
+  `instagram_cycle()` levam o link de afiliado até a fila e montam a legenda
+  com 3 hashtags sorteadas; `publish()` repassa o link para a fila.
+- `panel/index.html` — layout novo em grid de 12 colunas, header em vidro,
+  KPIs, cartões, switches, vitrine, logs e tela de login repaginados.
+- `panel/app.js` — dicas nas funções, logs coloridos por nível, preço/link na
+  vitrine, toast com animação e texto online/offline em português.
+- `tests/test_affiliate.py` — +6 testes (fila com link, sorteio de hashtags,
+  legenda/comentário, endpoint de comentário, publish → fila). Total 95.
+- `.env.example` — `IG_HASHTAG_COUNT=3`.
+
+**Análise / o que foi observado:**
+- O link no primeiro comentário é possível pela Graph API, mas **não fica
+  clicável** (assim como na legenda); o link clicável continua sendo o da bio.
+- Exige permissão de comentários no token. Se a chamada falhar, o post **não**
+  é desfeito: o bot só registra o aviso e mantém a publicação.
+- Itens antigos de `ig_queue.json` não têm `link`; nesses a legenda usa
+  "Link na bio" e nenhum comentário é enviado.
+- O painel anterior ficava estreito no desktop, com muito espaço vazio e
+  valores quebrando linha. O preview foi conferido no Chrome headless em
+  1440×1100 (sem Firebase real).
+
+**Resultado:**
+- ✅ 95 testes passando; `py_compile` e `node --check panel/app.js` OK.
+- ⚠️ Falta validar o comentário no Instagram real (permissão do token) e
+  publicar o painel novo na Vercel.
+
+---
+
 ## [2026-10-21 11:20] — Sessão 26.9: painel de controle remoto (Firebase + Vercel)
 
 **Objetivo:** painel web na Vercel, com login, para ligar/desligar funções do

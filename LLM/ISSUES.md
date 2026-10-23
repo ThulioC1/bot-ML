@@ -5,6 +5,32 @@
 
 ---
 
+## [ABERTA · 2026-10-23] Instagram: link no 1º comentário ainda não rodou AO VIVO
+
+O post do IG agora chama `POST /v18.0/{media_id}/comments` com o link de
+afiliado. Só foi testado com mock (95 testes). No Instagram real falta
+confirmar:
+
+- se o token de `IG_ACCESS_TOKEN` tem a permissão de **gerenciar comentários**
+  (sem ela, a API devolve erro e o bot apenas registra o aviso, mantendo o
+  post);
+- se o comentário aparece no post e se o texto "Link no primeiro comentário"
+  está coerente;
+- que itens antigos de `ig_queue.json` (sem o campo `link`) continuam saindo
+  com "Link na bio", sem comentário.
+
+> O link em comentário/legenda **não é clicável**; o link clicável continua
+> sendo o da bio.
+
+**Como validar:** publicar uma oferta no IG, abrir o post e conferir o
+comentário; se falhar, ver a linha `⚠️ Instagram comentário:` no painel/log.
+
+## [ABERTA · 2026-10-23] Painel novo ainda não foi publicado na Vercel
+
+`panel/index.html` e `panel/app.js` foram redesenhados e conferidos apenas em
+preview local (Chrome headless). Falta subir para a Vercel e testar com o
+Firebase real, em desktop e celular.
+
 ## [ABERTA · 2026-10-19] Cupons do ML: link da listagem e post real no grupo
 
 O parser foi validado com os HTMLs reais (`cupons_debug_ofertas_cupons.html`):
