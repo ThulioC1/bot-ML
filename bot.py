@@ -194,7 +194,8 @@ SELENIUM_STATE = {"ok": False, "msg": "não iniciado"}
 CDP_PORT = int(env("CDP_PORT", "9222") or 9222)
 CDP_HOST = env("CDP_HOST", "127.0.0.1")
 CDP_WAIT = int(env("CDP_WAIT", "6") or 6)
-_CDP = {"proc": None, "tried_at": 0, "msg": "não iniciado"}
+_CDP = {"proc": None, "tried_at": 0, "msg": "não iniciado", "target_id": None}
+_CDP_LOCK = threading.Lock()
 NET_STATE = {"online": True, "since": 0.0}
 
 # Mercado Livre e Shopee bloqueiam por IP (PolicyAgent / 403). Sem trocar o IP de
@@ -2199,24 +2200,53 @@ class _Page:
         self.headers = {"Content-Type": "text/html"}
 
 
+def _fechar_abas_extras(driver, principal=None):
+    """Fecha popups/abas abertas por scripts e volta para a aba principal.
+
+    Sem isso, cada clique que abre uma aba nova (window.open) deixava a aba
+    aberta para sempre e o Chrome ia ficando pesado.
+    """
+    try:
+        principal = principal or driver.current_window_handle
+        handles = driver.window_handles
+        if len(handles) <= 1:
+            return
+        for handle in handles:
+            if handle == principal:
+                continue
+            try:
+                driver.switch_to.window(handle)
+                driver.close()
+            except Exception:
+                pass
+        driver.switch_to.window(principal)
+    except Exception:
+        pass
+
+
 def selenium_get(url, wait=3, timeout=45):
     """Baixa a pagina pelo Chrome de verdade. Devolve o HTML ou None."""
     driver = selenium_driver()
     if driver is None:
         return None
     with _DRIVER_LOCK:
+        principal = None
         try:
+            principal = driver.current_window_handle
             driver.get(url)
             if wait:
                 time.sleep(wait)
             html = driver.page_source
+            atual = driver.current_url
             if _is_bot_wall(html[:2500]):
                 log("⚠️ Selenium não conseguiu abrir " + url[:60] + " (ML bloqueou o Chrome).")
                 return None
-            return _Page(html, driver.current_url)
+            return _Page(html, atual)
         except Exception as exc:
             log(f"⚠️ Selenium: {type(exc).__name__}: {exc}")
             return None
+        finally:
+            _fechar_abas_extras(driver, principal)
 
 
 def selenium_eval(url, script, wait=3, timeout=None, await_promise=True):
@@ -2230,7 +2260,9 @@ def selenium_eval(url, script, wait=3, timeout=None, await_promise=True):
         return None
     timeout = timeout or LINK_GEN_TIMEOUT
     with _DRIVER_LOCK:
+        principal = None
         try:
+            principal = driver.current_window_handle
             driver.get(url)
             if wait:
                 time.sleep(wait)
@@ -2255,6 +2287,9 @@ def selenium_eval(url, script, wait=3, timeout=None, await_promise=True):
             return {"ok": True, "value": raw}
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            _fechar_abas_extras(driver, principal)
+
 
 def chromium_candidates():
     """Binarios do Chromium em ordem de preferencia, com duplicados removidos."""
@@ -2404,8 +2439,66 @@ def cdp_server():
     return None
 
 
+def _cdp_abas(base):
+    """Lista as abas (targets type=page) abertas no Chromium via /json/list."""
+    try:
+        resp = requests.get(f"{base}/json/list", timeout=10)
+        alvos = resp.json() if resp.status_code == 200 else []
+    except Exception:
+        return []
+    if not isinstance(alvos, list):
+        return []
+    return [a for a in alvos if isinstance(a, dict)
+            and a.get("type") == "page" and a.get("webSocketDebuggerUrl")]
+
+
+def _cdp_aba(base):
+    """Devolve a aba fixa do bot, reaproveitando a que ja esta aberta.
+
+    Antes cada chamada criava uma aba nova e nunca fechava: o Chromium
+    acumulava dezenas de abas e ficava lento. Agora a mesma aba e usada em
+    todos os ciclos e as abas extras de execucoes antigas sao fechadas.
+    """
+    abas = _cdp_abas(base)
+    escolhida = None
+    for aba in abas:
+        if aba.get("id") == _CDP.get("target_id"):
+            escolhida = aba
+            break
+
+    if escolhida is None and abas:
+        escolhida = abas[0]
+        _CDP["target_id"] = escolhida.get("id")
+
+    if escolhida is None:
+        # O Chromium ja sobe com uma aba about:blank; isso e so uma garantia.
+        try:
+            resp = requests.put(f"{base}/json/new?about:blank", timeout=10)
+            if resp.status_code not in (200, 201):
+                resp = requests.get(f"{base}/json/new?about:blank", timeout=10)
+            escolhida = resp.json()
+        except Exception as exc:
+            log(f"⚠️ CDP: não consegui abrir aba ({type(exc).__name__})")
+            return None
+        if not isinstance(escolhida, dict) or not escolhida.get("webSocketDebuggerUrl"):
+            log("⚠️ CDP: resposta inesperada ao abrir aba.")
+            return None
+        _CDP["target_id"] = escolhida.get("id")
+        return escolhida
+
+    # Um Chromium do bot precisa de UMA aba so: fecha as que sobraram.
+    for aba in abas:
+        if aba.get("id") == escolhida.get("id"):
+            continue
+        try:
+            requests.get(f"{base}/json/close/{aba['id']}", timeout=5)
+        except Exception:
+            pass
+    return escolhida
+
+
 def _cdp_open(url, wait=None, timeout=90):
-    """Abre uma aba no Chromium, navega e devolve o WebSocket pronto."""
+    """Navega na aba fixa do Chromium e devolve o WebSocket pronto."""
     try:
         import websocket  # websocket-client (python puro, instala no Termux)
     except Exception:
@@ -2418,17 +2511,8 @@ def _cdp_open(url, wait=None, timeout=90):
         return None
     wait = CDP_WAIT if wait is None else wait
 
-    target = None
-    try:
-        resp = requests.put(f"{base}/json/new?about:blank", timeout=10)
-        if resp.status_code not in (200, 201):
-            resp = requests.get(f"{base}/json/new?about:blank", timeout=10)
-        target = resp.json()
-    except Exception as exc:
-        log(f"⚠️ CDP: não consegui abrir aba ({type(exc).__name__})")
-        return None
-    if not isinstance(target, dict) or not target.get("webSocketDebuggerUrl"):
-        log("⚠️ CDP: resposta inesperada ao abrir aba.")
+    target = _cdp_aba(base)
+    if target is None:
         return None
 
     try:
@@ -2500,47 +2584,49 @@ def _cdp_evaluate(ws, expression, await_promise=False, timeout=60):
 
 def cdp_get(url, wait=None, timeout=90):
     """Baixa a pagina por CDP e devolve o HTML renderizado, ou None."""
-    ws = _cdp_open(url, wait, timeout)
-    if ws is None:
-        return None
-    try:
-        html = _cdp_evaluate(ws, "document.documentElement.outerHTML",
-                             await_promise=False, timeout=45) or ""
-        if _is_bot_wall(html[:2500]):
-            log(f"⚠️ CDP: o site bloqueou o Chromium em {url[:55]}")
+    with _CDP_LOCK:
+        ws = _cdp_open(url, wait, timeout)
+        if ws is None:
             return None
-        if len(html) < 20000:
-            log(f"⚠️ CDP: página veio Vazia ({len(html)} bytes) de {url[:55]} — "
-                f"o site pode estar detectando o Chromium headless.")
-        return _Page(html, url)
-    except Exception as exc:
-        log(f"⚠️ CDP falhou em {url[:55]}: {type(exc).__name__}: {exc}")
-        _CDP["msg"] = f"{type(exc).__name__}"
-        return None
-    finally:
         try:
-            ws.close()
-        except Exception:
-            pass
+            html = _cdp_evaluate(ws, "document.documentElement.outerHTML",
+                                 await_promise=False, timeout=45) or ""
+            if _is_bot_wall(html[:2500]):
+                log(f"⚠️ CDP: o site bloqueou o Chromium em {url[:55]}")
+                return None
+            if len(html) < 20000:
+                log(f"⚠️ CDP: página veio Vazia ({len(html)} bytes) de {url[:55]} — "
+                    f"o site pode estar detectando o Chromium headless.")
+            return _Page(html, url)
+        except Exception as exc:
+            log(f"⚠️ CDP falhou em {url[:55]}: {type(exc).__name__}: {exc}")
+            _CDP["msg"] = f"{type(exc).__name__}"
+            return None
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 
 def cdp_eval(url, expression, wait=None, timeout=90, await_promise=True):
     """Executa JavaScript no Chromium via CDP e devolve {ok, value/error}."""
-    ws = _cdp_open(url, wait, timeout)
-    if ws is None:
-        return {"ok": False, "error": "CDP indisponível"}
-    try:
-        value = _cdp_evaluate(ws, expression, await_promise=await_promise,
-                              timeout=timeout)
-        return {"ok": True, "value": value}
-    except Exception as exc:
-        log(f"⚠️ CDP eval em {url[:55]}: {type(exc).__name__}: {exc}")
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    finally:
+    with _CDP_LOCK:
+        ws = _cdp_open(url, wait, timeout)
+        if ws is None:
+            return {"ok": False, "error": "CDP indisponível"}
         try:
-            ws.close()
-        except Exception:
-            pass
+            value = _cdp_evaluate(ws, expression, await_promise=await_promise,
+                                  timeout=timeout)
+            return {"ok": True, "value": value}
+        except Exception as exc:
+            log(f"⚠️ CDP eval em {url[:55]}: {type(exc).__name__}: {exc}")
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 
 def browser_eval(url, script, wait=3, timeout=None, await_promise=True):
@@ -2562,13 +2648,15 @@ def browser_eval(url, script, wait=3, timeout=None, await_promise=True):
 
 
 def cdp_close():
-    proc = _CDP.get("proc")
-    if proc is not None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        _CDP["proc"] = None
+    with _CDP_LOCK:
+        proc = _CDP.get("proc")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            _CDP["proc"] = None
+        _CDP["target_id"] = None
 
 
 def browser_get(url, wait=3, force_browser=False):

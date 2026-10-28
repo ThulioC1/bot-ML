@@ -367,6 +367,72 @@ class SeleniumEvalTests(unittest.TestCase):
             result = bot.selenium_eval("https://example.com", "return 1;", wait=0)
         self.assertEqual(result, {"ok": True, "value": {"ok": True, "products": [1]}})
 
+    def test_fecha_abas_abertas_pelo_script(self):
+        driver = mock.Mock()
+        driver.current_window_handle = "A"
+        driver.window_handles = ["A", "B", "C"]
+        driver.execute_async_script.return_value = {
+            "__selenium_eval__": True, "ok": True, "value": "ok",
+        }
+        with mock.patch.object(bot, "selenium_driver", return_value=driver):
+            bot.selenium_eval("https://example.com", "return 1;", wait=0)
+        fechadas = [c.args[0] for c in driver.switch_to.window.call_args_list]
+        self.assertEqual(fechadas.count("B"), 1)
+        self.assertEqual(fechadas.count("C"), 1)
+        self.assertEqual(driver.close.call_count, 2)
+        self.assertEqual(fechadas[-1], "A")
+
+
+class CdpTabTests(unittest.TestCase):
+    def setUp(self):
+        bot._CDP["target_id"] = None
+
+    def tearDown(self):
+        bot._CDP["target_id"] = None
+
+    def _lista(self, ids):
+        return [{"id": i, "type": "page", "webSocketDebuggerUrl": f"ws://{i}"}
+                for i in ids]
+
+    def test_reaproveita_aba_e_fecha_as_extras(self):
+        resposta = mock.Mock(status_code=200)
+        resposta.json.return_value = self._lista(["A", "B"])
+        with mock.patch.object(bot.requests, "get", return_value=resposta) as get, \
+                mock.patch.object(bot.requests, "put") as put:
+            aba = bot._cdp_aba("http://127.0.0.1:9222")
+        self.assertEqual(aba["id"], "A")
+        self.assertEqual(bot._CDP["target_id"], "A")
+        put.assert_not_called()
+        fechadas = [c.args[0] for c in get.call_args_list
+                    if "/json/close/" in c.args[0]]
+        self.assertEqual(fechadas, ["http://127.0.0.1:9222/json/close/B"])
+
+    def test_reusa_a_aba_ja_escolhida(self):
+        bot._CDP["target_id"] = "B"
+        resposta = mock.Mock(status_code=200)
+        resposta.json.return_value = self._lista(["A", "B"])
+        with mock.patch.object(bot.requests, "get", return_value=resposta) as get, \
+                mock.patch.object(bot.requests, "put") as put:
+            aba = bot._cdp_aba("http://127.0.0.1:9222")
+        self.assertEqual(aba["id"], "B")
+        put.assert_not_called()
+        fechadas = [c.args[0] for c in get.call_args_list
+                    if "/json/close/" in c.args[0]]
+        self.assertEqual(fechadas, ["http://127.0.0.1:9222/json/close/A"])
+
+    def test_so_cria_aba_se_nao_houver_nenhuma(self):
+        lista = mock.Mock(status_code=200)
+        lista.json.return_value = []
+        nova = mock.Mock(status_code=200)
+        nova.json.return_value = {"id": "N", "type": "page",
+                                  "webSocketDebuggerUrl": "ws://N"}
+        with mock.patch.object(bot.requests, "get", return_value=lista), \
+                mock.patch.object(bot.requests, "put", return_value=nova) as put:
+            aba = bot._cdp_aba("http://127.0.0.1:9222")
+        self.assertEqual(aba["id"], "N")
+        self.assertEqual(bot._CDP["target_id"], "N")
+        self.assertEqual(put.call_count, 1)
+
 
 class PublishTests(unittest.TestCase):
     def setUp(self):
