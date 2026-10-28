@@ -4372,6 +4372,7 @@ def channel_listener():
             if not control_enabled("channels"):
                 return
             PANEL_STATE["last_listener"] = time.time()
+            
 
             urls = re.findall(r"https?://[^\s]+", raw)
             for u in urls:
