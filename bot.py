@@ -2973,16 +2973,16 @@ def fetch_shopee_affiliate_products(search_query=None):
 
     let buttons = [];
     for (let i = 0; i < 60 && !buttons.length; i++) {
-      // Tenta vários seletores: classe antiga, classe nova, texto do botao.
+      // Tenta vários seletores, mas so aceita botoes cujo texto remeta a "link".
       const byClass = Array.from(document.querySelectorAll(
         ".get-link-btn, .shopee-button-outline--primary, button.shopee-button, [class*='get-link'], [class*='obter-link']"
-      ));
+      )).filter((b) => /obter link|get link|copiar link|copy link|link/i.test(text(b)));
       const byText = Array.from(document.querySelectorAll("button, a, div[role='button']"))
         .filter((el) => /obter link|get link|copiar link|copy link/i.test(text(el)));
       buttons = [...byClass, ...byText]
         .filter((b, idx, arr) => arr.indexOf(b) === idx)
         .filter((b) => visible(b) && !b.disabled
-                && !/massa|lote|batch/i.test(text(b)));
+                && !/massa|lote|batch|ver produto|see product/i.test(text(b)));
       if (!buttons.length) await sleep(500);
     }
     if (!buttons.length) {
