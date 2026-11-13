@@ -2926,25 +2926,42 @@ def fetch_shopee_affiliate_products(search_query=None):
         /https?:\/\/(?:shope\.ee|s\.shopee\.com\.br)\/[^\s"'<>]+/i);
       return m ? m[0].replace(/[.,);]+$/, "") : "";
     };
+    const readLinkAnywhere = () => {
+      // Fallback: escanea todo o documento por inputs com link de afiliado shopee.
+      for (const node of document.querySelectorAll("textarea, input")) {
+        for (const part of String(node.value || "").split(/\s+/)) {
+          if (/^https?:\/\/(?:shope\.ee|s\.shopee\.com\.br)\//i.test(part)) {
+            return part.replace(/[.,);]+$/, "");
+          }
+        }
+      }
+      return "";
+    };
     const cardOf = (btn) => {
       const card = btn.closest("a") || btn.parentElement;
-      if (card && card.querySelector(".product-name")) return card;
+      if (card && (card.querySelector(".product-name, [class*='product-name'], h2, h3, h4")))
+        return card;
       let node = btn.parentElement;
-      for (let i = 0; i < 8 && node; i++) {
-        if (node.querySelector(".product-name")
-            && node.querySelectorAll(".get-link-btn, .shopee-button-outline--primary, button.shopee-button, [class*='get-link'], [class*='obter-link']").length === 1) {
+      for (let i = 0; i < 10 && node; i++) {
+        if (node.querySelector(".product-name, [class*='product-name'], h2, h3, h4")
+            && node.querySelectorAll(".get-link-btn, .shopee-button-outline--primary, button.shopee-button, [class*='get-link'], [class*='obter-link']").length >= 1) {
           return node;
         }
         node = node.parentElement;
       }
       return card;
     };
+    const productNameOf = (card) => {
+      if (!card) return "";
+      const el = card.querySelector(".product-name, [class*='product-name'], h2, h3, h4");
+      return el ? text(el) : "";
+    };
     const imageOf = (card) => {
       const img = card && card.querySelector(".img-warpper img, img");
       return img ? (img.currentSrc || img.src || img.getAttribute("data-src") || "") : "";
     };
     const priceOf = (card) => {
-      const el = card && card.querySelector(".product-price");
+      const el = card && card.querySelector(".product-price, [class*='product-price'], [class*='price']");
       return el ? text(el) : "";
     };
     const offerOf = (btn, card) => {
@@ -2984,7 +3001,7 @@ def fetch_shopee_affiliate_products(search_query=None):
       const card = cardOf(btn);
       const item = {
         ok: false,
-        title: text(card && card.querySelector(".product-name")),
+        title: productNameOf(card),
         price: priceOf(card),
         image: imageOf(card),
         offer_id: offerOf(btn, card),
@@ -2996,19 +3013,26 @@ def fetch_shopee_affiliate_products(search_query=None):
         btn.click();
         let modal = null;
         let link = "";
-        for (let i = 0; i < 50 && !link; i++) {
+        for (let i = 0; i < 60 && !link; i++) {
           await sleep(300);
-          modal = document.querySelector(".get-link-modal");
-          if (visible(modal)) link = readLink(modal);
+          modal = document.querySelector(
+            ".get-link-modal, .ant-modal, [class*='modal'], [role='dialog']"
+          );
+          if (visible(modal)) {
+            link = readLink(modal) || readLinkAnywhere();
+          }
+        }
+        if (!link) {
+          link = readLinkAnywhere();
         }
         if (!link && modal) {
           const longTab = Array.from(
             modal.querySelectorAll('[role="tab"], .ant-tabs-tab, button')
-          ).find((el) => /link longo|long link/i.test(text(el)));
+          ).find((el) => /link longo|long link|copiar|copy/i.test(text(el)));
           if (longTab) {
             longTab.click();
             await sleep(700);
-            link = readLink(modal);
+            link = readLink(modal) || readLinkAnywhere();
           }
         }
         item.ok = !!link;
@@ -3018,8 +3042,13 @@ def fetch_shopee_affiliate_products(search_query=None):
         item.error = String(e);
       }
       products.push(item);
-      const modal = document.querySelector(".get-link-modal");
-      const close = modal && modal.querySelector(".ant-modal-close");
+      modal = document.querySelector(
+        ".get-link-modal, .ant-modal, [class*='modal'], [role='dialog']"
+      );
+      const close = modal && (modal.querySelector(".ant-modal-close")
+        || modal.querySelector("[class*='close']")
+        || modal.querySelector("button[aria-label*='close' i]")
+        || modal.querySelector("button[aria-label*='fechar' i]"));
       if (close) close.click();
       else document.dispatchEvent(new KeyboardEvent("keydown", {
         key: "Escape", keyCode: 27, which: 27, bubbles: true
