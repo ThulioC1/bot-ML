@@ -77,6 +77,31 @@ def log(msg):
     LOG_BUFFER.append(line)
 
 
+def ensure_single_instance():
+    """Impede duas instancias do bot rodando ao mesmo tempo.
+
+    Duas instancias disputando getUpdates geram HTTP 409 (Conflict) no
+    listener privado e duplicam publicacoes no canal/grupo.
+    """
+    pid = os.getpid()
+    if _LOCK_FILE.exists():
+        try:
+            antigo = int(_LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
+        except ValueError:
+            antigo = 0
+        if antigo and antigo != pid:
+            try:
+                os.kill(antigo, 0)  # so testa se o processo existe
+                log(f"❌ Outra instancia do bot ja esta rodando (PID {antigo}). Encerrando esta.")
+                sys.exit(0)
+            except OSError:
+                pass  # PID morto: assume travado e sobrescreve
+    try:
+        _LOCK_FILE.write_text(str(pid), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # Configuração
 # --------------------------------------------------------------------------
@@ -187,6 +212,10 @@ if IS_ANDROID:
 _DRIVER = None
 _DRIVER_LOCK = threading.Lock()
 SELENIUM_STATE = {"ok": False, "msg": "não iniciado"}
+SELENIUM_LAST_FAIL = 0.0
+SELENIUM_COOLDOWN = 300.0  # nao recria o Chrome enquanto falhou ha menos de 5 min
+
+_LOCK_FILE = BASE_DIR / "bot.lock"
 
 # --- Backend CDP (Chrome DevTools Protocol) ---------------------------
 # No Termux o Selenium nao funciona (selenium-manager nao existe para arm64),
@@ -1294,6 +1323,27 @@ def affiliate_link(url, price=None, title=None):
     return link, error or ""
 
 
+def _fallback_link(store, url):
+    """Anexa a tag de afiliado ao link original quando o gerador oficial falha.
+
+    Melhor publicar com o link direto + tag do que nao publicar nada.
+    """
+    if not url or not store:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    if store == "ml" and ML_AFFILIATE_TAG:
+        params["matt_word"] = [ML_AFFILIATE_TAG]
+    elif store == "amazon" and AMAZON_TAG:
+        params["tag"] = [AMAZON_TAG]
+    else:
+        return ""
+    query = urllib.parse.urlencode(params, doseq=True)
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment)
+    )
+
+
 # --------------------------------------------------------------------------
 # Vercel Blob
 # --------------------------------------------------------------------------
@@ -2073,9 +2123,15 @@ def selenium_driver(visible=False):
     afiliado (ML, Shopee e Amazon) e reaproveitado nas execucoes seguintes.
     `visible=True` abre a janela na tela para o usuario fazer o login.
     """
-    global _DRIVER
+    global _DRIVER, SELENIUM_LAST_FAIL
     if not USE_SELENIUM and not visible:
         return None
+    if not visible:
+        # Cooldown: evita tentar recriar o Chrome a cada chamada enquanto ele
+        # nao deu certo (SessionNotCreatedException, Chrome ausente, etc.).
+        agora = time.time()
+        if _DRIVER is None and agora - SELENIUM_LAST_FAIL < SELENIUM_COOLDOWN:
+            return None
     with _DRIVER_LOCK:
         if _DRIVER is not None:
             if visible:
@@ -2123,6 +2179,7 @@ def selenium_driver(visible=False):
             log(f"✅ Chrome (Selenium) iniciado — perfil: {BROWSER_PROFILE_DIR.name}")
             return driver
         except Exception as exc:
+            SELENIUM_LAST_FAIL = time.time()
             SELENIUM_STATE["ok"] = False
             SELENIUM_STATE["msg"] = f"falhou ({type(exc).__name__})"
             log(f"⚠️ Selenium: {SELENIUM_STATE['msg']}. Seguindo so com requests.")
@@ -3480,6 +3537,14 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
         link, aviso = generate_affiliate_link(permalink, price, title)
 
     if not link:
+        # Fallback: publica com o link original + tag de afiliado, preservando
+        # a comissao mesmo sem o gerador oficial do portal (login expirado,
+        # anti-bot, etc.).
+        store = _store_of_url(permalink)
+        link = _fallback_link(store, permalink)
+        aviso = "" if link else aviso
+
+    if not link:
         notify_link_failure(permalink, title, aviso)
         return False
 
@@ -4462,11 +4527,25 @@ def telegram_cycle():
     products = collect_products(include_scrape=control_enabled("scrape"),
                                 include_sheet=control_enabled("sheet"))
 
+    # Dedup: mesma oferta pode vir da planilha e da raspagem com ids distintos.
+    # Fica com a primeira ocorrencia e descarta o resto.
+    produtos_unicos = []
+    ids_vistos = set()
+    for p in products:
+        pid = p.get("id") or ""
+        if pid in ids_vistos:
+            continue
+        ids_vistos.add(pid)
+        produtos_unicos.append(p)
+    products = produtos_unicos
+
     new_sheet = [p for p in products if p["source"] == "planilha" and p["id"] not in seen]
     if new_sheet:
         log(f"📊 {len(new_sheet)} produto(s) novo(s) da planilha.")
         for product in new_sheet:
-            publish(product, announce_instagram=True)
+            if publish(product, announce_instagram=True):
+                seen[product["id"]] = {"price": product.get("price"),
+                                       "at": time.strftime("%d/%m %H:%M")}
             time.sleep(8)
     else:
         log("📊 Nenhum produto novo na planilha.")
@@ -4476,6 +4555,8 @@ def telegram_cycle():
         if sent >= POSTS_PER_CYCLE:
             break
         if publish(product, announce_instagram=True):
+            seen[product["id"]] = {"price": product.get("price"),
+                                   "at": time.strftime("%d/%m %H:%M")}
             sent += 1
             time.sleep(8)
     log(f"✅ Ciclo concluído: {sent} oferta(s) da raspagem publicada(s).\n")
@@ -4641,6 +4722,8 @@ def main():
     log("=" * 52)
     log(">>> BOT VAGANTE PROMOÇÕES <<<")
     log("=" * 52)
+
+    ensure_single_instance()
 
     if "--login" in sys.argv:
         log("🔐 Modo de autenticação do Telethon — informe telefone e código quando solicitado.")
