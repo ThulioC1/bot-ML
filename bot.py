@@ -1323,6 +1323,20 @@ def affiliate_link(url, price=None, title=None):
     return link, error or ""
 
 
+def _ml_affiliate_tag():
+    """Resolve a tag de afiliado do ML a ser usada no fallback (matt_word).
+
+    Prioridade: ML_AFFILIATE_TAG > ML_AFFILIATE_USERNAME > extrair de
+    ML_AFFILIATE (ex: social/coth8154082 -> coth8154082).
+    """
+    tag = env("ML_AFFILIATE_TAG") or env("ML_AFFILIATE_USERNAME") or ""
+    if not tag:
+        ml = env("ML_AFFILIATE") or ""
+        if ml and "/" in ml:
+            tag = ml.rsplit("/", 1)[-1]
+    return tag
+
+
 def _fallback_link(store, url):
     """Anexa a tag de afiliado ao link original quando o gerador oficial falha.
 
@@ -1332,8 +1346,12 @@ def _fallback_link(store, url):
         return ""
     parsed = urllib.parse.urlparse(url)
     params = urllib.parse.parse_qs(parsed.query)
-    if store == "ml" and ML_AFFILIATE_TAG:
-        params["matt_word"] = [ML_AFFILIATE_TAG]
+    if store == "ml":
+        tag = _ml_affiliate_tag()
+        if tag:
+            params["matt_word"] = [tag]
+        else:
+            return ""
     elif store == "amazon" and AMAZON_TAG:
         params["tag"] = [AMAZON_TAG]
     else:
@@ -3577,7 +3595,16 @@ def publish(product, chat_id=None, reply_to=None, announce_instagram=False):
         # a comissao mesmo sem o gerador oficial do portal (login expirado,
         # anti-bot, etc.).
         store = _store_of_url(permalink)
-        link = _fallback_link(store, permalink)
+        fallback_url = permalink
+        # Se for link de LOJA do ML (/social/), o gerador oficial ja tentou
+        # resolver o produto equivalente internamente. Para o fallback nao
+        # publicar o link de loja (que nao gera comissao), tente resolver o
+        # produto real e usar esse URL no fallback.
+        if store == "ml" and is_store_link(permalink):
+            resolved = resolve_store_link(permalink, price, title)
+            if resolved and resolved.get("url"):
+                fallback_url = resolved["url"]
+        link = _fallback_link(store, fallback_url)
         aviso = "" if link else aviso
 
     if not link:
