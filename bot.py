@@ -2932,7 +2932,7 @@ def fetch_shopee_affiliate_products(search_query=None):
       let node = btn.parentElement;
       for (let i = 0; i < 8 && node; i++) {
         if (node.querySelector(".product-name")
-            && node.querySelectorAll(".get-link-btn").length === 1) {
+            && node.querySelectorAll(".get-link-btn, .shopee-button-outline--primary, button.shopee-button, [class*='get-link'], [class*='obter-link']").length === 1) {
           return node;
         }
         node = node.parentElement;
@@ -2955,8 +2955,15 @@ def fetch_shopee_affiliate_products(search_query=None):
     };
 
     let buttons = [];
-    for (let i = 0; i < 40 && !buttons.length; i++) {
-      buttons = Array.from(document.querySelectorAll(".get-link-btn"))
+    for (let i = 0; i < 60 && !buttons.length; i++) {
+      // Tenta vários seletores: classe antiga, classe nova, texto do botao.
+      const byClass = Array.from(document.querySelectorAll(
+        ".get-link-btn, .shopee-button-outline--primary, button.shopee-button, [class*='get-link'], [class*='obter-link']"
+      ));
+      const byText = Array.from(document.querySelectorAll("button, a, div[role='button']"))
+        .filter((el) => /obter link|get link|copiar link|copy link/i.test(text(el)));
+      buttons = [...byClass, ...byText]
+        .filter((b, idx, arr) => arr.indexOf(b) === idx)
         .filter((b) => visible(b) && !b.disabled
                 && !/massa|lote|batch/i.test(text(b)));
       if (!buttons.length) await sleep(500);
@@ -2965,7 +2972,7 @@ def fetch_shopee_affiliate_products(search_query=None):
       return {
         ok: false,
         error: /\/auth(?:\/|$)/.test(location.pathname)
-          ? "login necessário" : "nenhum botão .get-link-btn na página",
+          ? "login necessário" : "nenhum botao de link encontrado (tentou .get-link-btn e texto 'Obter link')",
         url: location.href,
         title: document.title,
         preview: text(document.body).slice(0, 500)
